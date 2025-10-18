@@ -342,13 +342,10 @@ class Genius(commands.Cog):
         parent = thread.parent
         existing_threads_by_author = [t for t in parent.threads if t.owner_id == thread.owner_id and not t.archived and t.id != thread.id]
 
-        solved_command = self.bot.tree.get_command('solved', guild=discord.Object(id=cfg.guild_id))
-        solved_mention = f"</solved:{solved_command.id}>" if solved_command else "/solved"
-
         if not existing_threads_by_author:
-            await thread.send(f"{thread.owner.mention} Thanks for creating a new thread!\n\n**Please use {solved_mention} to close this thread when you're done.**")
+            await thread.send(f"{thread.owner.mention} Thanks for creating a new thread!\n\n**Please use `/solved` to close this thread when you're done.**")
         else:
-            await thread.send(f"{thread.owner.mention} You already have an open thread in this category. Please use {solved_mention} to close that thread before creating a new one.")
+            await thread.send(f"{thread.owner.mention} You already have an open thread in this category. Please use `/solved` to close that thread before creating a new one.")
             await thread.edit(archived=True)
 
 
