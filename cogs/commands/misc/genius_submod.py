@@ -340,7 +340,7 @@ class Genius(commands.Cog):
             return
         
         parent = thread.parent
-        existing_threads_by_author = [t for t in parent.threads if t.owner.id == thread.owner_id and not t.archived and t.id != thread.id]
+        existing_threads_by_author = [t for t in parent.threads if t.owner_id == thread.owner_id and not t.archived and t.id != thread.id]
 
         solved_command = self.bot.tree.get_command('solved', guild=discord.Object(id=cfg.guild_id))
         solved_mention = f"</solved:{solved_command.id}>" if solved_command else "/solved"
