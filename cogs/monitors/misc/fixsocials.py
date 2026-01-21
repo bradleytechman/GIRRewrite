@@ -24,7 +24,10 @@ class FixSocials(commands.Cog):
 
         # regex for twitter urls
         self.twitter_pattern = re.compile(r"(https:\/\/(www.)?(twitter|x)\.com\/[a-zA-Z0-9_]+\/status\/[0-9]+)")
-
+        
+        # regex for bluesky urls
+        self.bluesky_pattern = re.compile(r"https?://(?:www\.)?bsky\.(?:app|social)/profile/[^/\s]+/post/[^/\s]+", re.IGNORECASE)
+        
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -52,6 +55,9 @@ class FixSocials(commands.Cog):
         elif twitter_match := self.twitter_pattern.search(message_content):
             link = twitter_match.group(0)
             await self.fix_twitter(message, link)
+        elif bluesky_match := self.bluesky_pattern.search(message_content):
+            link = bluesky_match.group(0)
+            await self.fix_bluesky(message, link)
 
     @cached(ttl=3600)
     async def quickvids(self, tiktok_url):
@@ -117,7 +123,7 @@ class FixSocials(commands.Cog):
 
     async def fix_instagram(self, message: discord.Message, link: str):
         link = link.replace("www.", "")
-        link = link.replace("instagram.com", "d.ddinstagram.com")
+        link = link.replace("instagram.com", "uuinstagram.com")
 
         await message.reply(f"[I hate instagram but here you go]({link})", mention_author=False)
         await asyncio.sleep(0.5)
@@ -150,6 +156,16 @@ class FixSocials(commands.Cog):
             await message.reply(f"[I hate {random.choice(['twitter', '𝕏', 'Elon Musk'])} but here you go]({link})", mention_author=False)
             await asyncio.sleep(0.5)
             await message.edit(suppress=True)
+            
+    async def fix_bluesky(self, message: discord.Message, link: str):
+        link = link.replace("www.", "")
+        link = link.replace("bsky.app", "fxbsky.app")
+        link = link.replace("bsky.social", "fxbsky.app")
+
+        await message.reply(f"[I hate bluesky but here you go]({link})", mention_author=False)
+        await asyncio.sleep(0.5)
+        await message.edit(suppress=True)
+
 
 
 
