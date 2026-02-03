@@ -356,7 +356,7 @@ class Filter(commands.Cog):
             view.add_item(discord.ui.Button(label='Get Started', emoji="<:Guide:947350624385794079>",
                                             url=f"https://ios.cfw.guide/get-started/#required-reading", style=discord.ButtonStyle.url))
             view.add_item(discord.ui.Button(label='Jailbreak Chart', emoji="<:Search2:947525874297757706>",
-                                            url=f"https://docs.google.com/spreadsheets/d/e/2PACX-1vRXcZDsbk2j_AL5YCPnwAp6Ovf5xmLRwNK2wXrwGN__FCbkGWz6Be4l5JyHxEOyogjPnVl51nrDVOcC/pubhtml", style=discord.ButtonStyle.url))
+                                            url=f"https://docs.google.com/spreadsheets/d/e/2PACX-1vSv4WhrwAwLOxVWwADJ3uitnZNeNG-FH5hpG5PDHLobLZqJfJFMN70nDJwDgBhGuF7NcYXtJ5cQcfoK/pubhtml", style=discord.ButtonStyle.url))
 
             await message.reply(embed=embed, view=view, delete_after=20)
             return True
