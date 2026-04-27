@@ -123,7 +123,7 @@ class FixSocials(commands.Cog):
 
     async def fix_instagram(self, message: discord.Message, link: str):
         link = link.replace("www.", "")
-        link = link.replace("instagram.com", "uuinstagram.com")
+        link = link.replace("instagram.com", "kkinstagram.com")
 
         await message.reply(f"[I hate instagram but here you go]({link})", mention_author=False)
         await asyncio.sleep(0.5)
@@ -162,11 +162,9 @@ class FixSocials(commands.Cog):
         link = link.replace("bsky.app", "fxbsky.app")
         link = link.replace("bsky.social", "fxbsky.app")
 
-        await message.reply(f"[I hate bluesky but here you go]({link})", mention_author=False)
+        await message.reply(f"[I genuinely hate bluesky but here you go]({link})", mention_author=False)
         await asyncio.sleep(0.5)
         await message.edit(suppress=True)
-
-
 
 
 async def setup(bot):
