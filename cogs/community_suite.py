@@ -337,8 +337,15 @@ class CommunitySuite(commands.Cog):
     @app_commands.default_permissions(manage_messages=True)
     @app_commands.guilds(cfg.guild_id)
     @app_commands.command(name="announce", description="Post a clear announcement in a channel")
-    async def announce(self, interaction: discord.Interaction, channel: discord.TextChannel, title: str, message: str):
-        embed = discord.Embed(title=title[:256], description=message[:4000], color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc))
+    async def announce(self, interaction: discord.Interaction, channel: discord.TextChannel, title: str, message: str, color: str = "5865F2"):
+        color_value = color.lstrip("#")
+        try:
+            if len(color_value) != 6:
+                raise ValueError
+            embed_color = discord.Color(int(color_value, 16))
+        except ValueError:
+            await interaction.response.send_message("Use a six-character color such as 5865F2.", ephemeral=True); return
+        embed = discord.Embed(title=title[:256], description=message[:4000], color=embed_color, timestamp=datetime.now(timezone.utc))
         embed.set_footer(text=f"Posted by {interaction.user.display_name}")
         await channel.send(embed=embed); await interaction.response.send_message("Announcement posted.", ephemeral=True)
 
@@ -384,28 +391,12 @@ class CommunitySuite(commands.Cog):
             await interaction.response.send_message("Give me at least two choices separated by commas.", ephemeral=True); return
         await interaction.response.send_message(f"I choose **{random.choice(items)}**.")
 
-    @app_commands.guilds(cfg.guild_id)
-    @app_commands.command(name="membercount", description="Show how many people are in this server")
-    async def membercount(self, interaction: discord.Interaction):
-        await interaction.response.send_message(f"**{interaction.guild.member_count:,}** members are in {interaction.guild.name}.")
-
     @app_commands.default_permissions(manage_nicknames=True)
     @app_commands.guilds(cfg.guild_id)
     @app_commands.command(name="nickname", description="Change or clear a member's nickname")
     async def nickname(self, interaction: discord.Interaction, member: discord.Member, nickname: str | None = None):
         await member.edit(nick=nickname, reason=f"Changed by {interaction.user}")
         await interaction.response.send_message("Nickname updated.", ephemeral=True)
-
-    @app_commands.default_permissions(manage_messages=True)
-    @app_commands.guilds(cfg.guild_id)
-    @app_commands.command(name="embed", description="Post a simple formatted message")
-    async def embed_message(self, interaction: discord.Interaction, channel: discord.TextChannel, title: str, message: str, color: str = "5865F2"):
-        try:
-            embed_color = discord.Color(int(color.lstrip("#"), 16))
-        except ValueError:
-            await interaction.response.send_message("Use a six-character color such as 5865F2.", ephemeral=True); return
-        await channel.send(embed=discord.Embed(title=title[:256], description=message[:4000], color=embed_color))
-        await interaction.response.send_message("Formatted message posted.", ephemeral=True)
 
     games = app_commands.Group(name="games", description="Free game alerts and current giveaways", guild_ids=[cfg.guild_id])
 
@@ -538,15 +529,6 @@ class CommunitySuite(commands.Cog):
             emoji = await interaction.guild.create_custom_emoji(name=name[:32], image=data, reason=f"Added by {interaction.user}")
         except Exception as error: await interaction.followup.send(f"I could not create that emoji: {error}", ephemeral=True); return
         await interaction.followup.send(f"Added {emoji} from {user}.", ephemeral=True)
-
-    @app_commands.guilds(cfg.guild_id)
-    @app_commands.command(name="pfp", description="Get a Discord user's profile picture from their ID")
-    async def pfp(self, interaction: discord.Interaction, discord_id: str):
-        if not discord_id.isdigit(): await interaction.response.send_message("Enter a numeric Discord user ID.", ephemeral=True); return
-        try: user = await self.bot.fetch_user(int(discord_id))
-        except discord.NotFound: await interaction.response.send_message("I could not find that Discord user.", ephemeral=True); return
-        embed = discord.Embed(title=f"{user}'s profile picture", color=discord.Color.blurple()); embed.set_image(url=user.display_avatar.url)
-        await interaction.response.send_message(embed=embed)
 
     sticker = app_commands.Group(name="sticker", description="Manage server stickers", guild_ids=[cfg.guild_id], default_permissions=discord.Permissions(manage_emojis=True))
 
