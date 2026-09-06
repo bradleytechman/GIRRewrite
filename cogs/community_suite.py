@@ -24,7 +24,8 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from utils import cfg, logger
-from community_rules import caps_percent, has_invite, recent_count
+from utils.framework.permissions import gatekeeper
+from community_rules import caps_percent, has_invite, is_image_attachment, recent_count
 
 
 DATA_FILE = Path(os.environ.get(
@@ -482,6 +483,17 @@ class CommunitySuite(commands.Cog):
         settings = self.settings()
         lowered = message.content.lower().strip()
 
+        # Prevent image dumps from accounts that have not reached Member+.
+        # This focused safety rule stays active when general AutoMod is off.
+        image_attachments = [attachment for attachment in message.attachments
+                             if is_image_attachment(attachment.content_type, attachment.filename)]
+        if len(image_attachments) >= 4 and not gatekeeper.has(message.guild, message.author, 1):
+            image_rule = dict(settings["automod"])
+            image_rule.update({"deleteMessage": True, "timeoutHours": 168})
+            await self._moderate(message, image_rule,
+                                 f"{len(image_attachments)} images in one message from a user below Member+")
+            return
+
         if message.author.id in self.afk:
             self.afk.pop(message.author.id, None)
             try:
@@ -529,8 +541,8 @@ class CommunitySuite(commands.Cog):
         now = time.monotonic()
         key = (message.guild.id, message.author.id)
         self.activity[key].append(now)
-        if message.attachments and any(a.content_type and a.content_type.startswith("image/") for a in message.attachments):
-            self.images[key].extend([now] * len(message.attachments))
+        if image_attachments:
+            self.images[key].extend([now] * len(image_attachments))
         findings = []
         window = int(auto.get("imageWindowSeconds", 20))
         image_count = recent_count(self.images[key], now, window)
@@ -564,8 +576,10 @@ class CommunitySuite(commands.Cog):
                 action = f"Timed out for {hours} hours"
             except discord.HTTPException:
                 action = "Message removed; timeout could not be applied"
-        report_id = int(settings.get("reportChannelID") or getattr(cfg.channels, "reports", 0))
-        channel = message.guild.get_channel(report_id)
+        report_id = int(settings.get("reportChannelID") or 0)
+        channel = message.guild.get_channel(report_id) if report_id else None
+        channel = channel or discord.utils.get(message.guild.text_channels, name="reports")
+        channel = channel or message.guild.get_channel(int(getattr(cfg.channels, "reports", 0) or 0))
         if not channel:
             return
         embed = discord.Embed(title="🚨 Automatic moderation alert", color=discord.Color.red(), timestamp=datetime.now(timezone.utc))
@@ -585,13 +599,18 @@ class CommunitySuite(commands.Cog):
         custom_id = (interaction.data or {}).get("custom_id", "") if interaction.type == discord.InteractionType.component else ""
         if not custom_id.startswith("gir:report:"):
             return
-        if not interaction.user.guild_permissions.ban_members:
-            await interaction.response.send_message("You need permission to ban members to use this.", ephemeral=True); return
         _, _, action, user_id = custom_id.split(":", 3)
         if action == "ban":
-            await interaction.guild.ban(discord.Object(id=int(user_id)), reason=f"Reviewed AutoMod report by {interaction.user}")
-            await interaction.response.edit_message(content=f"Banned by {interaction.user.mention}", view=None)
+            if not interaction.user.guild_permissions.ban_members:
+                await interaction.response.send_message("You need permission to ban members to use this.", ephemeral=True); return
+            try:
+                await interaction.guild.ban(discord.Object(id=int(user_id)), reason=f"Reviewed AutoMod report by {interaction.user}")
+                await interaction.response.edit_message(content=f"Banned by {interaction.user.mention}", view=None)
+            except discord.Forbidden:
+                await interaction.response.send_message("Discord would not allow that ban. Check GIR's Ban Members permission and role position.", ephemeral=True)
         else:
+            if not interaction.user.guild_permissions.manage_messages:
+                await interaction.response.send_message("You need permission to manage messages to dismiss reports.", ephemeral=True); return
             await interaction.response.edit_message(content=f"Dismissed by {interaction.user.mention}", view=None)
 
     @commands.Cog.listener()
