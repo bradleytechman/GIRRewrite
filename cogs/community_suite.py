@@ -483,17 +483,25 @@ class CommunitySuite(commands.Cog):
                 break
         for item in settings.get("autoResponses", []):
             trigger = str(item.get("trigger", "")).lower().strip()
+            match_mode = str(item.get("matchMode", "contains"))
+            matched = lowered == trigger if match_mode == "exact" else bool(re.search(rf"(?<!\w){re.escape(trigger)}(?!\w)", lowered)) if match_mode == "word" else trigger in lowered
             allowed_channels = {int(value) for value in item.get("channelIDs", []) if str(value).isdigit()}
             message_channels = {message.channel.id, int(getattr(message.channel, "parent_id", 0) or 0)}
-            if (item.get("enabled", True) and trigger and trigger in lowered
+            if (item.get("enabled", True) and trigger and matched
                     and (not allowed_channels or allowed_channels & message_channels)):
                 emoji_text = str(item.get("emojiText", ""))[:100]
                 content = " ".join(value for value in (emoji_text, str(item.get("response", ""))[:1900]) if value).strip()
                 sticker = message.guild.get_sticker(int(item.get("stickerID", 0) or 0))
-                send_options = {"reference": message, "mention_author": False}
-                if sticker:
-                    send_options["stickers"] = [sticker]
-                await message.channel.send(content or None, **send_options)
+                for reaction in item.get("reactionEmojis", [])[:10]:
+                    try:
+                        await message.add_reaction(str(reaction))
+                    except discord.HTTPException:
+                        logger.warning("Could not add configured automatic reaction %s", reaction)
+                if content or sticker:
+                    send_options = {"reference": message, "mention_author": False}
+                    if sticker:
+                        send_options["stickers"] = [sticker]
+                    await message.channel.send(content or None, **send_options)
                 break
 
         auto = settings["automod"]
