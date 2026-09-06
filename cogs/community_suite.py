@@ -20,6 +20,7 @@ from pathlib import Path
 
 import discord
 import aiohttp
+from data.model import IdentityHistory
 from discord import app_commands
 from discord.ext import commands, tasks
 
@@ -53,6 +54,8 @@ DEFAULTS = {
                 "pingUserIDs": [], "allowEveryone": True, "allowedRoleIDs": [], "allowedUserIDs": [],
                 "ignoredUserIDs": [], "ignoredMessageIDs": [], "ignoredChannelIDs": [],
                 "ignoredThreadIDs": [], "joinThreadsWhenMentioned": True, "notifyOnIgnoredPing": False},
+    "identityHistory": {"enabled": True, "refreshMinutes": 15, "storeUsernames": True,
+                        "storeDisplayNames": True, "storeAvatarHashes": True, "storeRoles": True},
     "welcome": {"enabled": False, "channelID": 0, "message": "Welcome {mention} to {server}!", "goodbyeEnabled": False, "goodbyeMessage": "{name} left the server."},
     "autorole": {"enabled": False, "roleIDs": []},
     "starboard": {"enabled": False, "channelID": 0, "threshold": 3, "emoji": "⭐"},
@@ -103,6 +106,7 @@ class CommunitySuite(commands.Cog):
         self.relay_queue = asyncio.Queue(maxsize=10000)
         self.game_provider_health = {}
         self.game_check_lock = asyncio.Lock()
+        self.identity_observed = {}
         self.relay_worker = asyncio.create_task(self._relay_worker())
         self.free_game_check.start()
         self.free_game_request_check.start()
@@ -488,8 +492,34 @@ class CommunitySuite(commands.Cog):
         configured = int(self.settings().get("automod", {}).get("reportChannelID", 0) or 0)
         return (guild.get_channel(configured) if configured else None) or discord.utils.get(guild.text_channels, name="reports") or guild.get_channel(int(getattr(cfg.channels, "reports", 0) or 0))
 
+    def _observe_identity(self, user, status="member", force=False):
+        settings = self.settings().get("identityHistory", {})
+        if not settings.get("enabled", True) or getattr(user, "bot", False):
+            return
+        now = datetime.now(timezone.utc)
+        interval = max(1, min(1440, int(settings.get("refreshMinutes", 15)))) * 60
+        if not force and now.timestamp() - self.identity_observed.get(user.id, 0) < interval:
+            return
+        self.identity_observed[user.id] = now.timestamp()
+        names = {str(getattr(user, "name", "") or "")}
+        displays = {str(getattr(user, "global_name", "") or ""), str(getattr(user, "display_name", "") or "")}
+        avatar = getattr(getattr(user, "avatar", None), "key", None)
+        update = {"set__last_seen": now, "set__status": status, "inc__observations": 1,
+                  "set_on_insert__first_seen": now, "set_on_insert__account_created": getattr(user, "created_at", None)}
+        if settings.get("storeUsernames", True): update["add_to_set__usernames"] = next(iter(names - {""}), None)
+        if settings.get("storeDisplayNames", True): update["add_to_set__display_names"] = next(iter(displays - {""}), None)
+        if settings.get("storeAvatarHashes", True) and avatar: update["add_to_set__avatar_hashes"] = avatar
+        if settings.get("storeRoles", True) and hasattr(user, "roles"): update["set__role_ids"] = [role.id for role in user.roles]
+        if getattr(user, "joined_at", None): update["set__last_joined"] = user.joined_at
+        update = {key: value for key, value in update.items() if value is not None}
+        try:
+            IdentityHistory.objects(_id=user.id).update_one(upsert=True, **update)
+        except Exception:
+            logger.exception("Could not update identity history for %s", user.id)
+
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
+        self._observe_identity(member, "member", force=True)
         settings = self.settings()
         auto = settings["autorole"]
         if auto.get("enabled"):
@@ -508,6 +538,7 @@ class CommunitySuite(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
+        self._observe_identity(member, "left", force=True)
         welcome = self.settings()["welcome"]
         if welcome.get("goodbyeEnabled"):
             channel = member.guild.get_channel(int(welcome.get("channelID") or 0))
@@ -522,6 +553,7 @@ class CommunitySuite(commands.Cog):
             "channel": message.channel.name, "channelID": message.channel.id, "content": message.content,
             "jumpURL": message.jump_url, "attachments": [item.url for item in message.attachments]})
         settings = self.settings()
+        self._observe_identity(message.author)
         lowered = message.content.lower().strip()
 
         if (isinstance(message.channel, discord.Thread) and self.bot.user in message.mentions
@@ -621,6 +653,16 @@ class CommunitySuite(commands.Cog):
         if findings:
             await self._moderate(message, auto, findings[0])
             self.activity[key].clear(); self.images[key].clear()
+
+    @commands.Cog.listener()
+    async def on_member_update(self, before: discord.Member, after: discord.Member):
+        if before.guild.id == cfg.guild_id:
+            self._observe_identity(after, "member", force=True)
+
+    @commands.Cog.listener()
+    async def on_member_ban(self, guild: discord.Guild, user: discord.User):
+        if guild.id == cfg.guild_id:
+            self._observe_identity(user, "banned", force=True)
 
     async def _moderate(self, message: discord.Message, settings: dict, trigger: str):
         if settings.get("deleteMessage"):
