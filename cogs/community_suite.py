@@ -271,6 +271,11 @@ class CommunitySuite(commands.Cog):
             return
         channel = self.bot.get_channel(int(settings.get("channelID") or 0))
         if not channel:
+            preferred = {"free-games", "freebies", "game-deals", "giveaways"}
+            guild = self.bot.get_guild(cfg.guild_id)
+            channel = next((item for item in getattr(guild, "text_channels", []) if item.name.lower() in preferred), None)
+        if not channel:
+            logger.warning("Free-game alerts are enabled but no valid alert channel is available")
             return
         try:
             games = self.filtered_games(await self.fetch_free_games(settings), settings)
