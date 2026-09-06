@@ -366,28 +366,65 @@ class CommunitySuite(commands.Cog):
         await self.bot.wait_until_ready()
 
     @staticmethod
+    def _game_platform(game):
+        platforms = str(game.get("platforms", "")).lower()
+        choices = (("steam", "Steam", "https://store.steampowered.com/search/?term="),
+                   ("epic", "Epic Games Store", "https://store.epicgames.com/browse?q="),
+                   ("gog", "GOG", "https://www.gog.com/en/games?query="),
+                   ("xbox", "Xbox", "https://www.xbox.com/search/results?q="),
+                   ("playstation", "PlayStation", "https://store.playstation.com/search/"),
+                   ("switch", "Nintendo Switch", "https://www.nintendo.com/us/search/#q="),
+                   ("itch", "itch.io", "https://itch.io/search?q="))
+        for needle, label, search in choices:
+            if needle in platforms:
+                return label, search + quote(str(game.get("title", "")))
+        return "PC and console", None
+
+    @staticmethod
+    def _claim_kind(game):
+        text = " ".join(str(game.get(key, "")) for key in ("title", "description", "instructions")).lower()
+        temporary = ("free weekend", "free week", "free to play until", "play for free", "open beta", "playtest")
+        return "Free to play" if any(phrase in text for phrase in temporary) else "Free to keep"
+
+    @staticmethod
     def game_embed(game):
         title = str(game.get("title", "Free game"))[:256]
-        description = str(game.get("description", ""))[:2800]
         url = game.get("open_giveaway_url") or game.get("gamerpower_url") or "https://www.gamerpower.com/"
-        embed = discord.Embed(title=title, url=url, description=description, color=discord.Color.green())
-        embed.add_field(name="Platforms", value=str(game.get("platforms", "Unknown"))[:1024])
-        embed.add_field(name="Normal price", value=str(game.get("worth") or "Unknown"))
         end_time = CommunitySuite._game_date(game.get("end_date"))
-        end_label = discord.utils.format_dt(end_time, "R") if end_time else "While supplies last"
-        embed.add_field(name="Ends", value=end_label)
+        until = f" until {discord.utils.format_dt(end_time, 'd')}" if end_time else " while available"
+        claim_kind = CommunitySuite._claim_kind(game)
+        platform, _ = CommunitySuite._game_platform(game)
+        description = f"**{claim_kind}**{until}\n\n{str(game.get('description', '')).strip()[:700]}".strip()
+        embed = discord.Embed(title=title, url=url, description=description, color=discord.Color.from_rgb(88, 101, 242))
+        embed.set_author(name=platform)
         if game.get("image") or game.get("thumbnail"):
             embed.set_image(url=game.get("image") or game.get("thumbnail"))
         source = str(game.get("source") or "Giveaway source")
-        source_url = str(game.get("source_url") or url)
-        embed.add_field(name="Source", value=f"[{source}]({source_url})", inline=False)
+        worth = str(game.get("worth") or "").strip()
+        users = int(game.get("users") or 0)
+        footer = f"via {source}"
+        if worth and worth.lower() != "unknown":
+            footer += f" · Usually {worth}"
+        if users:
+            footer += f" · {users:,} claimed"
+        embed.set_footer(text=footer[:2048])
         return embed
+
+    @staticmethod
+    def game_view(game):
+        browser_url = str(game.get("open_giveaway_url") or game.get("gamerpower_url") or game.get("source_url") or "https://www.gamerpower.com/")
+        platform, store_url = CommunitySuite._game_platform(game)
+        view = discord.ui.View(timeout=None)
+        view.add_item(discord.ui.Button(label="Open in browser ↗", style=discord.ButtonStyle.link, url=browser_url[:512]))
+        if store_url and store_url != browser_url:
+            view.add_item(discord.ui.Button(label=f"Open in {platform} ↗"[:80], style=discord.ButtonStyle.link, url=store_url[:512]))
+        return view
 
     async def post_game(self, channel, game, settings):
         embed = self.game_embed(game)
         role_id = int(settings.get("pingRoleID") or 0); role = channel.guild.get_role(role_id)
         mentions = discord.AllowedMentions(roles=[role] if role else False, users=False, everyone=False)
-        await channel.send(content=role.mention if role else None, embed=embed, allowed_mentions=mentions)
+        await channel.send(content=role.mention if role else None, embed=embed, view=self.game_view(game), allowed_mentions=mentions)
 
     @staticmethod
     def _staff(member: discord.Member, settings: dict) -> bool:
@@ -744,7 +781,7 @@ class CommunitySuite(commands.Cog):
         games = self.filtered_games(await self.fetch_free_games(settings), settings)
         if not games:
             await interaction.followup.send("No matching offers are available to preview.", ephemeral=True); return
-        await interaction.followup.send(embed=self.game_embed(games[0]), ephemeral=True)
+        await interaction.followup.send(embed=self.game_embed(games[0]), view=self.game_view(games[0]), ephemeral=True)
 
     movie = app_commands.Group(name="movie", description="Plan a server movie night", guild_ids=[cfg.guild_id])
 
