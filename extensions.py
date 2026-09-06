@@ -1,9 +1,11 @@
+import json
 import os
+from pathlib import Path
 
 # The upstream bot was built for r/Jailbreak. Start with the general moderation,
 # utility, logging, XP, and self-service features that make sense in any Discord
 # server. The original jailbreak/news integrations remain available explicitly.
-initial_extensions = [
+default_extensions = [
     "cogs.commands.info.stats",
     "cogs.commands.info.help",
     "cogs.commands.info.tags",
@@ -24,6 +26,14 @@ initial_extensions = [
     "cogs.monitors.utils.birthday",
     "cogs.monitors.utils.xp",
 ]
+
+feature_file = Path(os.environ.get(
+    "GIR_FEATURE_FILE", "/Volumes/4TB/Services/GIR/dashboard/data/features.json"))
+try:
+    enabled_extensions = set(json.loads(feature_file.read_text()).get("enabled", []))
+    initial_extensions = [name for name in default_extensions if name in enabled_extensions]
+except (OSError, ValueError, TypeError):
+    initial_extensions = list(default_extensions)
 
 if os.environ.get("GIR_LEGACY_JAILBREAK_FEATURES") == "True":
     initial_extensions += [
