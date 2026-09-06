@@ -32,6 +32,8 @@ DATA_FILE = Path(os.environ.get(
     str(Path.home() / "Library/Application Support/SowensServer/GIRRuntime/dashboard/data/community.json"),
 ))
 GAME_STATE_FILE = DATA_FILE.with_name("free-games-state.json")
+GAME_STATUS_FILE = DATA_FILE.with_name("free-games-status.json")
+GAME_REQUEST_FILE = DATA_FILE.with_name("free-games-request.json")
 GAME_API = "https://www.gamerpower.com/api/giveaways"
 EPIC_API = "https://store-site-backend-static.ak.epicgames.com/freeGamesPromotions?locale=en-US&country=US&allowCountries=US"
 CHEAPSHARK_API = "https://www.cheapshark.com/api/1.0/deals?upperPrice=0&onSale=1&pageSize=60&sortBy=Recent"
@@ -95,11 +97,14 @@ class CommunitySuite(commands.Cog):
         self.afk = {}
         self.relay_queue = asyncio.Queue(maxsize=10000)
         self.game_provider_health = {}
+        self.game_check_lock = asyncio.Lock()
         self.relay_worker = asyncio.create_task(self._relay_worker())
         self.free_game_check.start()
+        self.free_game_request_check.start()
 
     def cog_unload(self):
         self.free_game_check.cancel()
+        self.free_game_request_check.cancel()
         self.relay_worker.cancel()
 
     def settings(self):
@@ -267,8 +272,24 @@ class CommunitySuite(commands.Cog):
         minutes = min(1440, max(5, int(settings.get("checkMinutes", 15) or 15)))
         if self.free_game_check.minutes != minutes:
             self.free_game_check.change_interval(minutes=minutes)
+        await self.run_free_game_check(settings)
+
+    def _save_game_status(self, state, **details):
+        now = datetime.now(timezone.utc)
+        payload = {"state": state, "updatedAt": int(now.timestamp()), "providerHealth": self.game_provider_health, **details}
+        GAME_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temporary = GAME_STATUS_FILE.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        temporary.replace(GAME_STATUS_FILE)
+        return payload
+
+    async def run_free_game_check(self, settings=None, *, manual=False):
+        settings = settings or self.settings()["freeGames"]
         if not settings.get("enabled"):
-            return
+            return self._save_game_status("disabled", message="Automatic free-game alerts are off")
+        if self.game_check_lock.locked():
+            return self._save_game_status("busy", message="A free-game check is already running")
+        minutes = min(1440, max(5, int(settings.get("checkMinutes", 15) or 15)))
         channel = self.bot.get_channel(int(settings.get("channelID") or 0))
         if not channel:
             preferred = {"free-games", "freebies", "game-deals", "giveaways"}
@@ -276,26 +297,62 @@ class CommunitySuite(commands.Cog):
             channel = next((item for item in getattr(guild, "text_channels", []) if item.name.lower() in preferred), None)
         if not channel:
             logger.warning("Free-game alerts are enabled but no valid alert channel is available")
-            return
-        try:
-            games = self.filtered_games(await self.fetch_free_games(settings), settings)
+            return self._save_game_status("failed", message="No valid free-game channel is available")
+        async with self.game_check_lock:
+            started = datetime.now(timezone.utc)
+            self._save_game_status("checking", startedAt=int(started.timestamp()), channelID=channel.id)
             try:
-                seen = set(json.loads(GAME_STATE_FILE.read_text()).get("seen", []))
-            except (OSError, ValueError, TypeError):
-                seen = {str(game.get("id")) for game in games}
-            unseen = [item for item in games if str(item.get("id")) not in seen]
-            post_limit = min(20, max(1, int(settings.get("maxPostsPerCheck", 5) or 5)))
-            for game in reversed(unseen[:post_limit]):
-                await self.post_game(channel, game, settings)
-            seen.update(str(game.get("id")) for game in games)
-            GAME_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            temporary = GAME_STATE_FILE.with_suffix(".tmp")
-            temporary.write_text(json.dumps({"seen": sorted(seen)[-2000:]}) + "\n"); temporary.replace(GAME_STATE_FILE)
-        except Exception:
-            logger.exception("Free game check failed")
+                games = self.filtered_games(await self.fetch_free_games(settings), settings)
+                try:
+                    saved = json.loads(GAME_STATE_FILE.read_text())
+                    seen = set(saved.get("seen", [])); history = list(saved.get("history", []))
+                except (OSError, ValueError, TypeError):
+                    seen = {str(game.get("id")) for game in games}; history = []
+                unseen = [item for item in games if str(item.get("id")) not in seen]
+                post_limit = min(20, max(1, int(settings.get("maxPostsPerCheck", 5) or 5)))
+                posted = []
+                for game in reversed(unseen[:post_limit]):
+                    await self.post_game(channel, game, settings)
+                    record = {"id": str(game.get("id")), "title": str(game.get("title", "Free game"))[:256],
+                              "source": str(game.get("source", "Unknown")), "channelID": channel.id,
+                              "postedAt": int(datetime.now(timezone.utc).timestamp())}
+                    posted.append(record); history.insert(0, record)
+                seen.update(str(game.get("id")) for game in games)
+                GAME_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+                temporary = GAME_STATE_FILE.with_suffix(".tmp")
+                temporary.write_text(json.dumps({"seen": sorted(seen)[-4000:], "history": history[:250]}, indent=2) + "\n")
+                temporary.replace(GAME_STATE_FILE)
+                finished = datetime.now(timezone.utc)
+                return self._save_game_status("complete", startedAt=int(started.timestamp()), lastCheck=int(finished.timestamp()),
+                    nextCheck=int(finished.timestamp()) + minutes * 60, durationMs=int((finished - started).total_seconds() * 1000),
+                    channelID=channel.id, offersFound=len(games), newOffers=len(unseen), posted=len(posted), manual=manual)
+            except Exception as error:
+                logger.exception("Free game check failed")
+                return self._save_game_status("failed", startedAt=int(started.timestamp()), lastCheck=int(time.time()),
+                                              channelID=channel.id, message=str(error)[:300], manual=manual)
 
     @free_game_check.before_loop
     async def before_free_game_check(self):
+        await self.bot.wait_until_ready()
+
+    @tasks.loop(seconds=10)
+    async def free_game_request_check(self):
+        try:
+            request = json.loads(GAME_REQUEST_FILE.read_text())
+        except (OSError, ValueError, TypeError):
+            return
+        if request.get("state") != "requested":
+            return
+        request["state"] = "working"; request["startedAt"] = int(time.time())
+        temporary = GAME_REQUEST_FILE.with_suffix(".tmp")
+        temporary.write_text(json.dumps(request, indent=2) + "\n"); temporary.replace(GAME_REQUEST_FILE)
+        result = await self.run_free_game_check(manual=True)
+        request.update({"state": "complete" if result.get("state") == "complete" else result.get("state", "failed"),
+                        "finishedAt": int(time.time()), "result": result})
+        temporary.write_text(json.dumps(request, indent=2) + "\n"); temporary.replace(GAME_REQUEST_FILE)
+
+    @free_game_request_check.before_loop
+    async def before_free_game_request_check(self):
         await self.bot.wait_until_ready()
 
     @staticmethod
@@ -653,7 +710,31 @@ class CommunitySuite(commands.Cog):
         health = "\n".join(f"**{name.title()}**: {state}" for name, state in sorted(self.game_provider_health.items()))
         if health:
             embed.add_field(name="Source health", value=health[:1024], inline=False)
+        runtime = {}
+        try:
+            runtime = json.loads(GAME_STATUS_FILE.read_text())
+        except (OSError, ValueError, TypeError):
+            pass
+        if runtime.get("lastCheck"):
+            checked = datetime.fromtimestamp(runtime["lastCheck"], timezone.utc)
+            embed.add_field(name="Last check", value=f"{discord.utils.format_dt(checked, 'R')} · {runtime.get('offersFound', 0)} matches · {runtime.get('posted', 0)} posted", inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @games.command(name="check", description="Check all enabled free-game sources now")
+    @app_commands.default_permissions(manage_guild=True)
+    async def games_check(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        result = await self.run_free_game_check(manual=True)
+        await interaction.followup.send(f"Check **{result['state']}** · {result.get('offersFound', 0)} matches · {result.get('posted', 0)} new posts.", ephemeral=True)
+
+    @games.command(name="preview", description="Preview the next matching free-game embed")
+    async def games_preview(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        settings = self.settings()["freeGames"]
+        games = self.filtered_games(await self.fetch_free_games(settings), settings)
+        if not games:
+            await interaction.followup.send("No matching offers are available to preview.", ephemeral=True); return
+        await interaction.followup.send(embed=self.game_embed(games[0]), ephemeral=True)
 
     movie = app_commands.Group(name="movie", description="Plan a server movie night", guild_ids=[cfg.guild_id])
 
