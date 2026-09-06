@@ -48,8 +48,14 @@ DEFAULTS = {
     "suggestions": {"enabled": False, "channelID": 0},
     "freeGames": {"enabled": False, "channelID": 0, "platforms": ["pc", "steam", "epic-games-store", "ps4", "ps5", "xbox-one", "xbox-series-xs"], "types": ["game"], "pingRoleID": 0},
     "movieNight": {"enabled": False, "channelID": 0, "pingRoleID": 0},
+    "relay": {"enabled": False, "destinationGuildID": 0, "messages": True, "edits": True,
+              "deletes": True, "reactions": True, "channelRoutes": []},
+    "appleEvents": {"enabled": False, "channelID": 0, "roleID": 0},
     "customCommands": [], "autoResponses": [], "reactionRoles": [], "disabledCommands": [],
 }
+
+_SETTINGS_CACHE = None
+_SETTINGS_MTIME = None
 
 
 def _merge(base, incoming):
@@ -60,10 +66,17 @@ def _merge(base, incoming):
 
 
 def load_settings():
+    global _SETTINGS_CACHE, _SETTINGS_MTIME
     try:
-        return _merge(DEFAULTS, json.loads(DATA_FILE.read_text()))
+        modified = DATA_FILE.stat().st_mtime_ns
+        if _SETTINGS_CACHE is None or modified != _SETTINGS_MTIME:
+            _SETTINGS_CACHE = _merge(DEFAULTS, json.loads(DATA_FILE.read_text()))
+            _SETTINGS_MTIME = modified
+        return _SETTINGS_CACHE
     except (OSError, ValueError, TypeError):
-        return _merge(DEFAULTS, {})
+        if _SETTINGS_CACHE is None:
+            _SETTINGS_CACHE = _merge(DEFAULTS, {})
+        return _SETTINGS_CACHE
 
 
 def render(template: str, member: discord.Member) -> str:
@@ -77,13 +90,60 @@ class CommunitySuite(commands.Cog):
         self.images = defaultdict(lambda: deque(maxlen=30))
         self.star_posts = {}
         self.afk = {}
+        self.relay_queue = asyncio.Queue(maxsize=10000)
+        self.relay_worker = asyncio.create_task(self._relay_worker())
         self.free_game_check.start()
 
     def cog_unload(self):
         self.free_game_check.cancel()
+        self.relay_worker.cancel()
 
     def settings(self):
         return load_settings()
+
+    def _queue_relay(self, event: str, channel_id: int, payload: dict):
+        relay = self.settings().get("relay", {})
+        event_flag = {"message": "messages", "edit": "edits", "delete": "deletes", "reaction": "reactions"}[event]
+        if not relay.get("enabled") or not relay.get(event_flag):
+            return
+        route = next((item for item in relay.get("channelRoutes", [])
+                      if int(item.get("sourceChannelID", 0)) == channel_id), None)
+        if not route:
+            return
+        payload.update({"event": event, "destinationChannelID": int(route.get("destinationChannelID", 0))})
+        try:
+            self.relay_queue.put_nowait(payload)
+        except asyncio.QueueFull:
+            logger.error("Audit relay queue is full; newest event was dropped")
+
+    async def _relay_worker(self):
+        while True:
+            item = await self.relay_queue.get()
+            try:
+                destination = self.bot.get_channel(item["destinationChannelID"])
+                if not isinstance(destination, discord.TextChannel):
+                    continue
+                colors = {"message": discord.Color.blurple(), "edit": discord.Color.orange(),
+                          "delete": discord.Color.red(), "reaction": discord.Color.green()}
+                titles = {"message": "Message", "edit": "Message edited", "delete": "Message deleted", "reaction": "Reaction"}
+                embed = discord.Embed(title=titles[item["event"]], description=str(item.get("content") or "No text")[:3500],
+                                      color=colors[item["event"]], timestamp=datetime.now(timezone.utc))
+                embed.add_field(name="Member", value=f"{item.get('author', 'Unknown')} · `{item.get('authorID', 'Unknown')}`", inline=False)
+                embed.add_field(name="Source", value=f"#{item.get('channel', 'unknown')} · `{item.get('channelID')}`", inline=True)
+                if item.get("detail"):
+                    embed.add_field(name="Details", value=str(item["detail"])[:1024], inline=True)
+                if item.get("jumpURL"):
+                    embed.add_field(name="Original", value=f"[Open message]({item['jumpURL']})", inline=False)
+                attachments = item.get("attachments", [])
+                if attachments:
+                    embed.add_field(name="Attachments", value="\n".join(attachments)[:1024], inline=False)
+                await destination.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Could not relay Discord audit event")
+            finally:
+                self.relay_queue.task_done()
 
     async def fetch_free_games(self):
         async with aiohttp.ClientSession(headers={"User-Agent": "GIR Discord Bot"}) as session:
@@ -175,6 +235,9 @@ class CommunitySuite(commands.Cog):
     async def on_message(self, message: discord.Message):
         if not message.guild or message.author.bot or message.guild.id != cfg.guild_id:
             return
+        self._queue_relay("message", message.channel.id, {"author": str(message.author), "authorID": message.author.id,
+            "channel": message.channel.name, "channelID": message.channel.id, "content": message.content,
+            "jumpURL": message.jump_url, "attachments": [item.url for item in message.attachments]})
         settings = self.settings()
         lowered = message.content.lower().strip()
 
@@ -277,6 +340,11 @@ class CommunitySuite(commands.Cog):
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
         if payload.guild_id != cfg.guild_id or payload.member is None or payload.member.bot:
             return
+        channel = self.bot.get_channel(payload.channel_id)
+        self._queue_relay("reaction", payload.channel_id, {"author": str(payload.member), "authorID": payload.user_id,
+            "channel": getattr(channel, "name", "unknown"), "channelID": payload.channel_id,
+            "content": str(payload.emoji), "detail": "Reaction added",
+            "jumpURL": f"https://discord.com/channels/{payload.guild_id}/{payload.channel_id}/{payload.message_id}"})
         settings = self.settings()
         for item in settings.get("reactionRoles", []):
             if item.get("enabled", True) and int(item.get("messageID", 0)) == payload.message_id and str(item.get("emoji")) == str(payload.emoji):
@@ -315,12 +383,36 @@ class CommunitySuite(commands.Cog):
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
         if payload.guild_id != cfg.guild_id:
             return
+        guild = self.bot.get_guild(payload.guild_id); member = guild.get_member(payload.user_id) if guild else None
+        channel = self.bot.get_channel(payload.channel_id)
+        if member and not member.bot:
+            self._queue_relay("reaction", payload.channel_id, {"author": str(member), "authorID": payload.user_id,
+                "channel": getattr(channel, "name", "unknown"), "channelID": payload.channel_id,
+                "content": str(payload.emoji), "detail": "Reaction removed",
+                "jumpURL": f"https://discord.com/channels/{payload.guild_id}/{payload.channel_id}/{payload.message_id}"})
         for item in self.settings().get("reactionRoles", []):
             if item.get("enabled", True) and int(item.get("messageID", 0)) == payload.message_id and str(item.get("emoji")) == str(payload.emoji):
                 guild = self.bot.get_guild(payload.guild_id); member = guild.get_member(payload.user_id) if guild else None
                 role = guild.get_role(int(item.get("roleID", 0))) if guild else None
                 if member and role:
                     await member.remove_roles(role, reason="GIR reaction role removed")
+
+    @commands.Cog.listener()
+    async def on_message_edit(self, before: discord.Message, after: discord.Message):
+        if not before.guild or before.guild.id != cfg.guild_id or before.author.bot or before.content == after.content:
+            return
+        self._queue_relay("edit", before.channel.id, {"author": str(before.author), "authorID": before.author.id,
+            "channel": before.channel.name, "channelID": before.channel.id,
+            "content": f"Before:\n{before.content[:1600]}\n\nAfter:\n{after.content[:1600]}", "jumpURL": after.jump_url})
+
+    @commands.Cog.listener()
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
+        message = payload.cached_message
+        if payload.guild_id != cfg.guild_id or not message or message.author.bot:
+            return
+        self._queue_relay("delete", payload.channel_id, {"author": str(message.author), "authorID": message.author.id,
+            "channel": message.channel.name, "channelID": payload.channel_id, "content": message.content,
+            "attachments": [item.url for item in message.attachments]})
 
     @app_commands.guilds(cfg.guild_id)
     @app_commands.command(name="suggest", description="Send an idea to the server suggestion board")

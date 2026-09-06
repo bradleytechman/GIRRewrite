@@ -22,7 +22,13 @@ import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 
-intents = discord.Intents.all()
+# Keep the events GIR uses while avoiding presence and typing firehoses on very
+# large servers. Member and message-content access are checked by the dashboard.
+intents = discord.Intents.default()
+intents.members = True
+intents.message_content = True
+intents.presences = False
+intents.typing = False
 mentions = discord.AllowedMentions(everyone=False, users=True, roles=False)
 
 
@@ -121,7 +127,8 @@ class MyTree(app_commands.CommandTree):
         return True
 
 
-bot = Bot(command_prefix='!', intents=intents, allowed_mentions=mentions, tree_cls=MyTree)
+bot = Bot(command_prefix='!', intents=intents, allowed_mentions=mentions, tree_cls=MyTree,
+          chunk_guilds_at_startup=False, max_messages=5000)
 
 @bot.tree.error
 async def app_command_error(interaction: discord.Interaction, error: AppCommandError):
