@@ -6,6 +6,7 @@ actions start disabled, and every automatic action can be reviewed in Discord.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import random
@@ -26,7 +27,7 @@ from discord.ext import commands, tasks
 
 from utils import cfg, logger
 from utils.framework.permissions import gatekeeper
-from community_rules import caps_percent, detect_scam, has_invite, is_image_attachment, recent_count
+from community_rules import caps_percent, detect_scam, has_invite, is_image_attachment, normalize_obfuscated_text, recent_count
 
 
 DATA_FILE = Path(os.environ.get(
@@ -53,7 +54,9 @@ DEFAULTS = {
     "reports": {"pingModeratorRole": True, "pingAdministratorRole": False, "pingRoleIDs": [],
                 "pingUserIDs": [], "allowEveryone": True, "allowedRoleIDs": [], "allowedUserIDs": [],
                 "ignoredUserIDs": [], "ignoredMessageIDs": [], "ignoredChannelIDs": [],
-                "ignoredThreadIDs": [], "joinThreadsWhenMentioned": True, "notifyOnIgnoredPing": False},
+                "ignoredThreadIDs": [], "joinThreadsWhenMentioned": True, "notifyOnIgnoredPing": False,
+                "includeImages": True, "maxLogImages": 4, "reportCooldownSeconds": 45,
+                "batchBanMax": 50, "batchBanDelayMs": 1100, "detectInvisibleCharacters": True},
     "identityHistory": {"enabled": True, "refreshMinutes": 15, "storeUsernames": True,
                         "storeDisplayNames": True, "storeAvatarHashes": True, "storeRoles": True},
     "welcome": {"enabled": False, "channelID": 0, "message": "Welcome {mention} to {server}!", "goodbyeEnabled": False, "goodbyeMessage": "{name} left the server."},
@@ -107,6 +110,8 @@ class CommunitySuite(commands.Cog):
         self.game_provider_health = {}
         self.game_check_lock = asyncio.Lock()
         self.identity_observed = {}
+        self.recent_reports = {}
+        self.report_batches = defaultdict(set)
         self.relay_worker = asyncio.create_task(self._relay_worker())
         self.free_game_check.start()
         self.free_game_request_check.start()
@@ -554,7 +559,8 @@ class CommunitySuite(commands.Cog):
             "jumpURL": message.jump_url, "attachments": [item.url for item in message.attachments]})
         settings = self.settings()
         self._observe_identity(message.author)
-        lowered = message.content.lower().strip()
+        visible_content = normalize_obfuscated_text(message.content) if settings.get("reports", {}).get("detectInvisibleCharacters", True) else message.content
+        lowered = visible_content.lower().strip()
 
         if (isinstance(message.channel, discord.Thread) and self.bot.user in message.mentions
                 and settings.get("reports", {}).get("joinThreadsWhenMentioned", True)):
@@ -568,7 +574,7 @@ class CommunitySuite(commands.Cog):
             return
 
         attachment_text = " ".join(f"{item.filename} {getattr(item, 'description', '') or ''}" for item in message.attachments)
-        scam_reason = detect_scam(f"{message.content} {attachment_text}")
+        scam_reason = detect_scam(f"{visible_content} {attachment_text}")
         if settings["automod"].get("scamDetection", True) and scam_reason and not gatekeeper.has(message.guild, message.author, 1):
             scam_rule = dict(settings["automod"])
             scam_rule.update({"deleteMessage": True, "timeoutHours": int(scam_rule.get("scamTimeoutHours", 168))})
@@ -648,7 +654,7 @@ class CommunitySuite(commands.Cog):
             findings.append("mostly capital letters")
         if auto.get("mentionSpam") and len(message.mentions) + len(message.role_mentions) >= int(auto.get("mentionThreshold", 6)):
             findings.append("too many mentions")
-        if auto.get("inviteLinks") and has_invite(message.content):
+        if auto.get("inviteLinks") and has_invite(visible_content):
             findings.append("Discord invite link")
         if findings:
             await self._moderate(message, auto, findings[0])
@@ -681,18 +687,34 @@ class CommunitySuite(commands.Cog):
         channel = self._report_channel(message.guild)
         if not channel:
             return
+        group = hashlib.sha256(trigger.casefold().encode()).hexdigest()[:16]
+        self.report_batches[group].add(message.author.id)
+        cooldown = max(0, min(3600, int(self.settings().get("reports", {}).get("reportCooldownSeconds", 45))))
+        report_key = (message.author.id, group)
+        if time.monotonic() - self.recent_reports.get(report_key, 0) < cooldown:
+            return
+        self.recent_reports[report_key] = time.monotonic()
         embed = discord.Embed(title="🚨 Automatic moderation alert", color=discord.Color.red(), timestamp=datetime.now(timezone.utc))
         embed.add_field(name="Member", value=f"{message.author.mention}\n`{message.author.id}`", inline=False)
         embed.add_field(name="Channel", value=message.channel.mention, inline=True)
         embed.add_field(name="Trigger", value=trigger, inline=True)
         embed.add_field(name="Action", value=action, inline=False)
-        if message.attachments:
+        embed.add_field(name="Campaign group", value=f"`{group}` · {len(self.report_batches[group])} account(s)", inline=False)
+        report_settings = self.settings().get("reports", {})
+        if message.attachments and report_settings.get("includeImages", True):
             embed.set_image(url=message.attachments[0].url)
         view = discord.ui.View(timeout=None)
         view.add_item(discord.ui.Button(label="Ban", style=discord.ButtonStyle.danger, custom_id=f"gir:report:ban:{message.author.id}"))
+        view.add_item(discord.ui.Button(label="Ban matching", style=discord.ButtonStyle.danger, custom_id=f"gir:report:banbatch:{group}"))
         view.add_item(discord.ui.Button(label="Dismiss", style=discord.ButtonStyle.secondary, custom_id=f"gir:report:dismiss:{message.author.id}"))
         content, mentions = self._report_mentions(message.guild)
-        await channel.send(content=content, embed=embed, view=view, allowed_mentions=mentions)
+        maximum = max(1, min(10, int(report_settings.get("maxLogImages", 4))))
+        extras = []
+        if report_settings.get("includeImages", True):
+            for item in message.attachments[1:maximum]:
+                if (item.content_type or "").startswith("image/"):
+                    extra = discord.Embed(url=message.jump_url); extra.set_image(url=item.url); extras.append(extra)
+        await channel.send(content=content, embeds=[embed, *extras], view=view, allowed_mentions=mentions)
 
     @commands.Cog.listener()
     async def on_interaction(self, interaction: discord.Interaction):
@@ -700,12 +722,42 @@ class CommunitySuite(commands.Cog):
         if not custom_id.startswith("gir:report:"):
             return
         _, _, action, user_id = custom_id.split(":", 3)
+        if action == "banbatch":
+            if not interaction.user.guild_permissions.ban_members:
+                await interaction.response.send_message("You need permission to ban members to use this.", ephemeral=True); return
+            report_settings = self.settings().get("reports", {})
+            target_set = set(self.report_batches.get(user_id, set()))
+            if not target_set:
+                async for report_message in interaction.channel.history(limit=500):
+                    for report_embed in report_message.embeds:
+                        fields = {field.name: field.value for field in report_embed.fields}
+                        if f"`{user_id}`" in fields.get("Campaign group", ""):
+                            match = re.search(r"`(\d{15,22})`", fields.get("Member", ""))
+                            if match: target_set.add(int(match.group(1)))
+            targets = list(target_set)[:max(1, min(100, int(report_settings.get("batchBanMax", 50))))]
+            if not targets:
+                await interaction.response.send_message("No matching accounts remain in this active campaign group.", ephemeral=True); return
+            await interaction.response.defer(ephemeral=True); banned, failed = 0, 0
+            delay = max(250, min(5000, int(report_settings.get("batchBanDelayMs", 1100)))) / 1000
+            for target in targets:
+                try:
+                    await interaction.guild.ban(discord.Object(id=target), reason=f"Matching AutoMod campaign reviewed by {interaction.user}")
+                    banned += 1
+                except discord.HTTPException:
+                    failed += 1
+                await asyncio.sleep(delay)
+            await interaction.followup.send(f"Batch review complete: **{banned} banned**, **{failed} failed**. Campaign `{user_id}`.", ephemeral=True)
+            embed = interaction.message.embeds[0]; embed.add_field(name="Batch review", value=f"{interaction.user.mention}: {banned} banned, {failed} failed", inline=False)
+            await interaction.message.edit(embed=embed, view=None)
+            return
         if action == "ban":
             if not interaction.user.guild_permissions.ban_members:
                 await interaction.response.send_message("You need permission to ban members to use this.", ephemeral=True); return
             try:
                 await interaction.guild.ban(discord.Object(id=int(user_id)), reason=f"Reviewed AutoMod report by {interaction.user}")
-                await interaction.response.edit_message(content=f"Banned by {interaction.user.mention}", view=None)
+                embed = interaction.message.embeds[0]
+                embed.add_field(name="Review outcome", value=f"Banned by {interaction.user.mention}\nCause: {next((f.value for f in embed.fields if f.name == 'Trigger'), 'reported message')}", inline=False)
+                await interaction.response.edit_message(content=f"Banned by {interaction.user.mention}", embed=embed, view=None)
             except discord.Forbidden:
                 await interaction.response.send_message("Discord would not allow that ban. Check GIR's Ban Members permission and role position.", ephemeral=True)
         else:

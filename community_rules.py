@@ -12,6 +12,11 @@ SCAM_ACTIONS = re.compile(r"\b(click|verify|connect|scan|deposit|send|withdraw|a
 SCAM_URGENCY = re.compile(r"\b(now|today only|limited time|act fast|expires?|within\s+\d+\s*(?:minutes?|hours?))\b", re.I)
 SCAM_SECRETS = re.compile(r"\b(seed phrase|recovery phrase|private key|wallet phrase|password|qr code)\b", re.I)
 SUSPICIOUS_HOST = re.compile(r"(?:xn--|bit\.ly|tinyurl\.com|t\.co|discord(?:-|\.)?gift|disc[o0]rd|ste[a4]m|mrbeast)[^\s/]*", re.I)
+INVISIBLE_CHARACTERS = re.compile(r"[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\uffa0]")
+
+
+def normalize_obfuscated_text(text: str) -> str:
+    return INVISIBLE_CHARACTERS.sub("", str(text or ""))
 
 
 def caps_percent(text: str) -> int:
@@ -36,7 +41,7 @@ def is_image_attachment(content_type, filename: str) -> bool:
 
 def detect_scam(text: str) -> Optional[str]:
     """Return a plain-language reason when several independent scam signals agree."""
-    normalized = " ".join(str(text or "").split())
+    normalized = " ".join(normalize_obfuscated_text(text).split())
     if not normalized:
         return None
     has_url = bool(URL_PATTERN.search(normalized))

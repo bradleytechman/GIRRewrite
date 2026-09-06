@@ -1,6 +1,6 @@
 import unittest
 
-from community_rules import caps_percent, detect_scam, has_invite, is_image_attachment, recent_count
+from community_rules import caps_percent, detect_scam, has_invite, is_image_attachment, normalize_obfuscated_text, recent_count
 
 
 def test_detects_fake_mrbeast_giveaway():
@@ -14,6 +14,12 @@ def test_detects_wallet_secret_theft():
 def test_does_not_flag_normal_scam_discussion():
     assert detect_scam("I saw a video explaining the MrBeast scam yesterday") is None
     assert detect_scam("Steam has a giveaway on its official store") is None
+
+
+def test_removes_invisible_invite_bypass_characters():
+    hidden = "https://disc\u200bord.\u200bgg/example"
+    assert normalize_obfuscated_text(hidden) == "https://discord.gg/example"
+    assert has_invite(normalize_obfuscated_text(hidden))
 
 
 class CommunityRuleTests(unittest.TestCase):
