@@ -4,28 +4,24 @@ from __future__ import annotations
 import asyncio
 import difflib
 import hashlib
-import json
 import os
 import random
 import re
-import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
 import discord
 from discord import app_commands
-from discord.ext import commands, tasks
+from discord.ext import commands
 
-from cogs.community_suite import DATA_FILE, load_settings
 from utils import cfg, logger
 
 
 IPSW_API = "https://api.ipsw.me/v4"
 APPLE_EVENTS = "https://www.apple.com/apple-events/"
-APPLE_RSS = "https://www.apple.com/newsroom/rss-feed.rss"
+APPLE_NEWSROOM = "https://www.apple.com/newsroom/"
 TSSCHECKER = os.environ.get("TSSCHECKER_PATH", str(Path.home() / "Library/Application Support/SowensServer/bin/tsschecker"))
-APPLE_STATE = Path(os.environ.get("GIR_COMMUNITY_FILE", "community.json")).with_name("apple-events-state.json")
 
 QUESTIONS = (
     "What small thing made your day better?", "What game deserves a remake?", "What is your perfect weekend?",
@@ -42,17 +38,13 @@ class ServerSuite(commands.Cog):
     engage = app_commands.Group(name="engage", description="Games and friendly community activities", guild_ids=[cfg.guild_id])
     modtools = app_commands.Group(name="modtools", description="Extra tools for moderators", guild_ids=[cfg.guild_id],
                                   default_permissions=discord.Permissions(manage_messages=True))
-    apple = app_commands.Group(name="apple", description="Apple events and firmware signing", guild_ids=[cfg.guild_id])
+    apple = app_commands.Group(name="apple", description="Official Apple event and developer links", guild_ids=[cfg.guild_id])
     tss = app_commands.Group(name="tss", description="Check Apple firmware signing and device support", guild_ids=[cfg.guild_id])
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._devices = []
         self._device_cache_time = 0.0
-        self.apple_event_check.start()
-
-    def cog_unload(self):
-        self.apple_event_check.cancel()
 
     @engage.command(name="eightball", description="Ask GIR a yes-or-no question")
     async def eightball(self, interaction: discord.Interaction, question: str):
@@ -314,86 +306,13 @@ class ServerSuite(commands.Cog):
     async def apple_events(self, interaction: discord.Interaction):
         await interaction.response.send_message(f"🍎 Apple event schedule and replays: {APPLE_EVENTS}")
 
-    @apple.command(name="latest", description="Show the latest item in Apple's official Newsroom feed")
+    @apple.command(name="latest", description="Open Apple's official Newsroom")
     async def apple_latest(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        try:
-            async with aiohttp.ClientSession(headers={"User-Agent": "GIR/1.0"}) as session:
-                async with session.get(APPLE_RSS, timeout=25) as response:
-                    response.raise_for_status(); root = ET.fromstring(await response.text())
-            item = root.find("./channel/item")
-            await interaction.followup.send(f"🍎 **{item.findtext('title')}**\n{item.findtext('link')}")
-        except Exception:
-            await interaction.followup.send("I could not reach Apple Newsroom right now.", ephemeral=True)
+        await interaction.response.send_message(f"🍎 Apple Newsroom: {APPLE_NEWSROOM}")
 
     @apple.command(name="developer", description="Open Apple's developer event schedule")
     async def apple_developer(self, interaction: discord.Interaction):
         await interaction.response.send_message("Apple developer sessions, labs, and events: https://developer.apple.com/events/")
-
-    def _save_apple_settings(self, enabled: bool, channel_id: int = 0, role_id: int = 0):
-        try: current = json.loads(DATA_FILE.read_text())
-        except (OSError, ValueError): current = {}
-        current["appleEvents"] = {"enabled": enabled, "channelID": channel_id, "roleID": role_id}
-        DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
-        temporary = DATA_FILE.with_suffix(".tmp"); temporary.write_text(json.dumps(current, indent=2) + "\n"); temporary.replace(DATA_FILE)
-
-    @app_commands.default_permissions(manage_guild=True)
-    @apple.command(name="subscribe", description="Send Apple event alerts to a channel")
-    async def apple_subscribe(self, interaction: discord.Interaction, channel: discord.TextChannel, role: discord.Role = None):
-        self._save_apple_settings(True, channel.id, role.id if role else 0)
-        await interaction.response.send_message(f"Apple event alerts will be posted in {channel.mention}.", ephemeral=True)
-
-    @app_commands.default_permissions(manage_guild=True)
-    @apple.command(name="unsubscribe", description="Turn off Apple event alerts")
-    async def apple_unsubscribe(self, interaction: discord.Interaction):
-        self._save_apple_settings(False)
-        await interaction.response.send_message("Apple event alerts are off.", ephemeral=True)
-
-    @apple.command(name="status", description="Show Apple event alert settings")
-    async def apple_status(self, interaction: discord.Interaction):
-        settings = load_settings().get("appleEvents", {})
-        channel = interaction.guild.get_channel(int(settings.get("channelID", 0)))
-        await interaction.response.send_message(
-            f"Apple event alerts are **{'on' if settings.get('enabled') else 'off'}**"
-            + (f" in {channel.mention}." if channel else "."), ephemeral=True)
-
-    @tasks.loop(minutes=30)
-    async def apple_event_check(self):
-        settings = load_settings().get("appleEvents", {})
-        if not settings.get("enabled"):
-            return
-        channel = self.bot.get_channel(int(settings.get("channelID", 0)))
-        if not channel:
-            return
-        try:
-            async with aiohttp.ClientSession(headers={"User-Agent": "GIR/1.0"}) as session:
-                async with session.get(APPLE_RSS, timeout=25) as response:
-                    response.raise_for_status(); body = await response.text()
-            root = ET.fromstring(body)
-            event_items = []
-            for item in root.findall("./channel/item"):
-                title, link = item.findtext("title", ""), item.findtext("link", "")
-                searchable = title + " " + item.findtext("description", "")
-                if re.search(r"\b(apple event|wwdc|keynote|worldwide developers conference)\b", searchable, re.I):
-                    event_items.append({"title": title, "link": link})
-            try: seen = set(json.loads(APPLE_STATE.read_text()).get("seen", []))
-            except (OSError, ValueError): seen = set()
-            current = {item["link"] for item in event_items if item["link"]}
-            APPLE_STATE.parent.mkdir(parents=True, exist_ok=True)
-            APPLE_STATE.write_text(json.dumps({"seen": sorted(current), "checkedAt": datetime.now(timezone.utc).isoformat()}))
-            new_items = [item for item in event_items if seen and item["link"] not in seen]
-            for item in reversed(new_items[:3]):
-                role = channel.guild.get_role(int(settings.get("roleID", 0)))
-                await channel.send(content=role.mention if role else None,
-                    embed=discord.Embed(title=item["title"][:256], description=f"[Read the official Apple announcement]({item['link']})\n\n[Apple Events]({APPLE_EVENTS})", color=discord.Color.red()),
-                    allowed_mentions=discord.AllowedMentions(roles=True))
-        except Exception:
-            logger.exception("Apple event check failed")
-
-    @apple_event_check.before_loop
-    async def before_apple_event_check(self):
-        await self.bot.wait_until_ready()
-
 
 async def setup(bot):
     await bot.add_cog(ServerSuite(bot))
