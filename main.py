@@ -1,6 +1,8 @@
 import asyncio
 import os
 import traceback
+import json
+from pathlib import Path
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -61,10 +63,21 @@ class MyTree(app_commands.CommandTree):
         if interaction.user.bot:
             return False
 
+        command = interaction.command
+
+        if command is not None:
+            root_name = command.root_parent.name if command.root_parent else command.name
+            settings_path = Path(os.environ.get("GIR_COMMUNITY_FILE", str(Path.home() / "Library/Application Support/SowensServer/GIRRuntime/dashboard/data/community.json")))
+            try:
+                disabled = set(json.loads(settings_path.read_text()).get("disabledCommands", []))
+            except (OSError, ValueError, TypeError):
+                disabled = set()
+            if root_name in disabled and interaction.user.id != cfg.owner_id:
+                await interaction.response.send_message("That command is currently turned off for this server.", ephemeral=True)
+                return False
+
         if gatekeeper.has(interaction.user.guild, interaction.user, 6):
             return True
-
-        command = interaction.command
 
         if isinstance(interaction.command, discord.app_commands.ContextMenu):
             return True
