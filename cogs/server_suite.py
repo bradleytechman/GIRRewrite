@@ -8,6 +8,8 @@ import json
 import os
 import random
 import re
+import shutil
+import tempfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +27,8 @@ IPSW_API = "https://api.ipsw.me/v4"
 APPLE_EVENTS = "https://www.apple.com/apple-events/"
 APPLE_RSS = "https://www.apple.com/newsroom/rss-feed.rss"
 TSSCHECKER = os.environ.get("TSSCHECKER_PATH", str(Path.home() / "Library/Application Support/SowensServer/bin/tsschecker"))
+TSS_WORK_ROOT = Path(os.environ.get("GIR_TSS_WORK_ROOT", "/Volumes/4TB/Services/TSSChecker/runtime"))
+TSS_CONCURRENCY = asyncio.Semaphore(2)
 APPLE_STATE = Path(os.environ.get("GIR_COMMUNITY_FILE", "community.json")).with_name("apple-events-state.json")
 
 QUESTIONS = (
@@ -178,15 +182,32 @@ class ServerSuite(commands.Cog):
             return device, version, "incompatible", "That iOS version was not released for this device."
         result = None
         if Path(TSSCHECKER).is_file():
+            work_dir = None
             try:
-                process = await asyncio.create_subprocess_exec(TSSCHECKER, "-d", device["identifier"], "-i", version, "-b",
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-                output, _ = await asyncio.wait_for(process.communicate(), timeout=45)
+                TSS_WORK_ROOT.mkdir(parents=True, exist_ok=True)
+                work_dir = Path(tempfile.mkdtemp(prefix="request-", dir=TSS_WORK_ROOT))
+                environment = os.environ.copy()
+                environment.update({"TMPDIR": str(work_dir), "HOME": str(work_dir), "XDG_CACHE_HOME": str(work_dir / "cache")})
+                async with TSS_CONCURRENCY:
+                    process = await asyncio.create_subprocess_exec(
+                        TSSCHECKER, "-d", device["identifier"], "-i", version, "-b",
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                        cwd=work_dir, env=environment,
+                    )
+                    try:
+                        output, _ = await asyncio.wait_for(process.communicate(), timeout=45)
+                    except asyncio.TimeoutError:
+                        process.kill()
+                        await process.communicate()
+                        raise
                 text = output.decode(errors="replace")
                 if "IS being signed" in text: result = True
                 elif "IS NOT being signed" in text: result = False
             except (OSError, asyncio.TimeoutError):
                 logger.exception("TSSChecker signing request failed")
+            finally:
+                if work_dir:
+                    shutil.rmtree(work_dir, ignore_errors=True)
         catalog_signed = bool(firmware.get("signed"))
         if result is not None and result != catalog_signed:
             return device, version, "uncertain", "TSSChecker and the firmware catalog disagree. Try again later before restoring."

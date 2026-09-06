@@ -46,7 +46,7 @@ DEFAULTS = {
     "autorole": {"enabled": False, "roleIDs": []},
     "starboard": {"enabled": False, "channelID": 0, "threshold": 3, "emoji": "⭐"},
     "suggestions": {"enabled": False, "channelID": 0},
-    "freeGames": {"enabled": False, "channelID": 0, "platforms": ["pc", "steam", "epic-games-store", "ps4", "ps5", "xbox-one", "xbox-series-xs"], "types": ["game"], "pingRoleID": 0},
+    "freeGames": {"enabled": False, "channelID": 0, "platforms": ["pc", "steam", "epic-games-store", "ps4", "ps5", "xbox-one", "xbox-series-xs"], "types": ["game"], "pingRoleID": 0, "minimumWorth": 0, "hideUnrated": False, "includeExpired": False, "maxPostsPerCheck": 5},
     "movieNight": {"enabled": False, "channelID": 0, "pingRoleID": 0},
     "relay": {"enabled": False, "destinationGuildID": 0, "messages": True, "edits": True,
               "deletes": True, "reactions": True, "channelRoutes": []},
@@ -156,8 +156,28 @@ class CommunitySuite(commands.Cog):
     def filtered_games(self, games, settings):
         platforms = {str(value).lower() for value in settings.get("platforms", [])}
         types = {str(value).lower() for value in settings.get("types", [])}
-        return [game for game in games if (not platforms or any(platform in str(game.get("platforms", "")).lower() for platform in platforms))
-                and (not types or str(game.get("type", "")).lower() in types)]
+        minimum_worth = max(0.0, float(settings.get("minimumWorth", 0) or 0))
+        now = datetime.now(timezone.utc)
+
+        def worth(game):
+            match = re.search(r"\d+(?:\.\d+)?", str(game.get("worth") or "0").replace(",", ""))
+            return float(match.group()) if match else 0.0
+
+        def active(game):
+            if settings.get("includeExpired") or not game.get("end_date"):
+                return True
+            try:
+                end = datetime.strptime(game["end_date"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                return end > now
+            except (TypeError, ValueError):
+                return True
+
+        return [game for game in games
+                if (not platforms or any(platform in str(game.get("platforms", "")).lower() for platform in platforms))
+                and (not types or str(game.get("type", "")).lower() in types)
+                and worth(game) >= minimum_worth
+                and (not settings.get("hideUnrated") or worth(game) > 0)
+                and active(game)]
 
     @tasks.loop(minutes=15)
     async def free_game_check(self):
@@ -173,7 +193,9 @@ class CommunitySuite(commands.Cog):
                 seen = set(json.loads(GAME_STATE_FILE.read_text()).get("seen", []))
             except (OSError, ValueError, TypeError):
                 seen = {str(game.get("id")) for game in games}
-            for game in reversed([item for item in games if str(item.get("id")) not in seen]):
+            unseen = [item for item in games if str(item.get("id")) not in seen]
+            post_limit = min(20, max(1, int(settings.get("maxPostsPerCheck", 5) or 5)))
+            for game in reversed(unseen[:post_limit]):
                 await self.post_game(channel, game, settings)
             seen.update(str(game.get("id")) for game in games)
             GAME_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -193,12 +215,18 @@ class CommunitySuite(commands.Cog):
         embed = discord.Embed(title=title, url=url, description=description, color=discord.Color.green())
         embed.add_field(name="Platforms", value=str(game.get("platforms", "Unknown"))[:1024])
         embed.add_field(name="Normal price", value=str(game.get("worth") or "Unknown"))
-        embed.add_field(name="Ends", value=str(game.get("end_date") or "While supplies last"))
+        try:
+            end_time = datetime.strptime(str(game.get("end_date")), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            end_label = discord.utils.format_dt(end_time, "R")
+        except (TypeError, ValueError):
+            end_label = "While supplies last"
+        embed.add_field(name="Ends", value=end_label)
         if game.get("image") or game.get("thumbnail"):
             embed.set_image(url=game.get("image") or game.get("thumbnail"))
         embed.add_field(name="Source", value="[Giveaway data from GamerPower](https://www.gamerpower.com/)", inline=False)
         role_id = int(settings.get("pingRoleID") or 0); role = channel.guild.get_role(role_id)
-        await channel.send(content=role.mention if role else None, embed=embed, allowed_mentions=discord.AllowedMentions(roles=True))
+        mentions = discord.AllowedMentions(roles=[role] if role else False, users=False, everyone=False)
+        await channel.send(content=role.mention if role else None, embed=embed, allowed_mentions=mentions)
 
     @staticmethod
     def _staff(member: discord.Member, settings: dict) -> bool:
@@ -506,6 +534,19 @@ class CommunitySuite(commands.Cog):
         embed = discord.Embed(title="Free games available now", description="\n".join(lines)[:4000], color=discord.Color.green())
         embed.add_field(name="Source", value="[Giveaway data from GamerPower](https://www.gamerpower.com/)")
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @games.command(name="status", description="Show how free-game alerts are configured")
+    async def games_status(self, interaction: discord.Interaction):
+        settings = self.settings()["freeGames"]
+        channel = interaction.guild.get_channel(int(settings.get("channelID") or 0))
+        embed = discord.Embed(title="Free-game alerts", color=discord.Color.green())
+        embed.add_field(name="Automatic alerts", value="On" if settings.get("enabled") else "Off")
+        embed.add_field(name="Channel", value=channel.mention if channel else "Not selected")
+        embed.add_field(name="Platforms", value=", ".join(settings.get("platforms", [])) or "All", inline=False)
+        embed.add_field(name="Offer types", value=", ".join(settings.get("types", [])) or "All")
+        embed.add_field(name="Minimum normal price", value=f"${float(settings.get('minimumWorth', 0) or 0):.2f}")
+        embed.set_footer(text="Giveaway data provided by GamerPower")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     movie = app_commands.Group(name="movie", description="Plan a server movie night", guild_ids=[cfg.guild_id])
 
