@@ -42,6 +42,13 @@ class Bot(commands.Bot):
 
         setup_context_commands(self)
 
+        # Keep slash commands current without requiring the owner to run !sync
+        # after an update. GIR's commands are guild-scoped, so this takes effect
+        # immediately in the configured server.
+        if os.environ.get("GIR_SYNC_COMMANDS", "True") == "True":
+            synced = await self.tree.sync(guild=discord.Object(id=cfg.guild_id))
+            logger.info(f"Synced {len(synced)} application commands.")
+
         self.tasks = Tasks(self)
         await init_client_session()
 
@@ -166,4 +173,5 @@ async def main():
     async with bot:
         await bot.start(os.environ.get("GIR_TOKEN"), reconnect=True)
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
