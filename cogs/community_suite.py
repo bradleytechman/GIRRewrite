@@ -111,7 +111,6 @@ class CommunitySuite(commands.Cog):
         self.free_game_check.cancel()
         self.free_game_request_check.cancel()
         self.relay_worker.cancel()
-        self.bot.tree.remove_command("Report message", guild=discord.Object(id=cfg.guild_id), type=discord.AppCommandType.message)
 
     def settings(self):
         return load_settings()
@@ -1083,5 +1082,3 @@ class CommunitySuite(commands.Cog):
 async def setup(bot):
     cog = CommunitySuite(bot)
     await bot.add_cog(cog)
-    bot.tree.add_command(app_commands.ContextMenu(name="Report message", callback=cog.report_message),
-                         guild=discord.Object(id=cfg.guild_id))
