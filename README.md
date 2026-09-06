@@ -1,4 +1,7 @@
 # GIR Rewrite
+
+> This file preserves the upstream project history and original cross-platform setup notes. For the current dashboard, production features, hosting choices, and live command reference, start with the repository-level documentation.
+
 ![GIR banner](data/images/banner.png)
 
 GIR is a sophisticated moderation and miscellaneous utilities Discord bot created for the [r/Jailbreak Discord server](https://reddit.com/r/jailbreak). It features:
