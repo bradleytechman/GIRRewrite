@@ -55,7 +55,6 @@ DEFAULTS = {
     "movieNight": {"enabled": False, "channelID": 0, "pingRoleID": 0},
     "relay": {"enabled": False, "destinationGuildID": 0, "messages": True, "edits": True,
               "deletes": True, "reactions": True, "channelRoutes": []},
-    "appleEvents": {"enabled": False, "channelID": 0, "roleID": 0},
     "customCommands": [], "autoResponses": [], "reactionRoles": [], "disabledCommands": [],
 }
 
