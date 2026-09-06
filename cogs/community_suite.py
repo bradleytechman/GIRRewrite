@@ -11,6 +11,7 @@ import os
 import random
 import re
 import zipfile
+import xml.etree.ElementTree as ET
 from io import BytesIO
 import time
 from urllib.parse import quote, urlparse
