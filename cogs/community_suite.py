@@ -13,6 +13,7 @@ import re
 import zipfile
 from io import BytesIO
 import time
+from urllib.parse import quote
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -32,6 +33,8 @@ DATA_FILE = Path(os.environ.get(
 ))
 GAME_STATE_FILE = DATA_FILE.with_name("free-games-state.json")
 GAME_API = "https://www.gamerpower.com/api/giveaways"
+EPIC_API = "https://store-site-backend-static.ak.epicgames.com/freeGamesPromotions?locale=en-US&country=US&allowCountries=US"
+CHEAPSHARK_API = "https://www.cheapshark.com/api/1.0/deals?upperPrice=0&onSale=1&pageSize=60&sortBy=Recent"
 
 DEFAULTS = {
     "automod": {
@@ -46,7 +49,7 @@ DEFAULTS = {
     "autorole": {"enabled": False, "roleIDs": []},
     "starboard": {"enabled": False, "channelID": 0, "threshold": 3, "emoji": "⭐"},
     "suggestions": {"enabled": False, "channelID": 0},
-    "freeGames": {"enabled": False, "channelID": 0, "platforms": ["pc", "steam", "epic-games-store", "ps4", "ps5", "xbox-one", "xbox-series-xs"], "types": ["game"], "pingRoleID": 0, "minimumWorth": 0, "hideUnrated": False, "includeExpired": False, "maxPostsPerCheck": 5},
+    "freeGames": {"enabled": False, "channelID": 0, "platforms": ["pc", "steam", "epic-games-store", "ps4", "ps5", "xbox-one", "xbox-series-xs"], "types": ["game"], "sources": ["gamerpower", "epic", "cheapshark"], "checkMinutes": 15, "pingRoleID": 0, "minimumWorth": 0, "hideUnrated": False, "includeExpired": False, "maxPostsPerCheck": 5},
     "movieNight": {"enabled": False, "channelID": 0, "pingRoleID": 0},
     "relay": {"enabled": False, "destinationGuildID": 0, "messages": True, "edits": True,
               "deletes": True, "reactions": True, "channelRoutes": []},
@@ -91,6 +94,7 @@ class CommunitySuite(commands.Cog):
         self.star_posts = {}
         self.afk = {}
         self.relay_queue = asyncio.Queue(maxsize=10000)
+        self.game_provider_health = {}
         self.relay_worker = asyncio.create_task(self._relay_worker())
         self.free_game_check.start()
 
@@ -145,13 +149,87 @@ class CommunitySuite(commands.Cog):
             finally:
                 self.relay_queue.task_done()
 
-    async def fetch_free_games(self):
-        async with aiohttp.ClientSession(headers={"User-Agent": "GIR Discord Bot"}) as session:
-            async with session.get(GAME_API, timeout=20) as response:
+    async def _fetch_json(self, session, name, url):
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as response:
                 if response.status == 201:
-                    return []
+                    return name, []
                 response.raise_for_status()
-                return await response.json()
+                return name, await response.json(content_type=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
+            logger.warning("Free-game provider %s failed: %s", name, error)
+            return name, error
+
+    @staticmethod
+    def _epic_games(payload):
+        rows = payload.get("data", {}).get("Catalog", {}).get("searchStore", {}).get("elements", [])
+        games = []
+        for row in rows:
+            promotions = (row.get("promotions") or {}).get("promotionalOffers") or []
+            offers = [offer for block in promotions for offer in block.get("promotionalOffers", [])]
+            free = next((offer for offer in offers if offer.get("discountSetting", {}).get("discountPercentage") == 0), None)
+            if not free:
+                continue
+            images = row.get("keyImages") or []
+            image = next((item.get("url") for item in images if item.get("type") in {"OfferImageWide", "DieselStoreFrontWide"}), None)
+            slug = row.get("productSlug") or row.get("urlSlug") or ""
+            price = row.get("price", {}).get("totalPrice", {}).get("fmtPrice", {}).get("originalPrice") or "Unknown"
+            games.append({"id": f"epic:{row.get('id')}", "title": row.get("title"), "description": row.get("description"),
+                          "platforms": "PC, Epic Games Store", "type": "game", "worth": price,
+                          "end_date": free.get("endDate"), "image": image,
+                          "open_giveaway_url": f"https://store.epicgames.com/p/{slug}" if slug else "https://store.epicgames.com/free-games",
+                          "source": "Epic Games Store", "source_url": "https://store.epicgames.com/free-games"})
+        return games
+
+    @staticmethod
+    def _cheapshark_games(rows):
+        return [{"id": f"cheapshark:{row.get('dealID')}", "title": row.get("title"), "description": "A store deal currently listed at no cost.",
+                 "platforms": "PC", "type": "game", "worth": f"${float(row.get('normalPrice') or 0):.2f}",
+                 "end_date": None, "thumbnail": row.get("thumb"),
+                 "open_giveaway_url": f"https://www.cheapshark.com/redirect?dealID={quote(str(row.get('dealID') or ''), safe='')}",
+                 "source": "CheapShark", "source_url": "https://www.cheapshark.com/"}
+                for row in rows if float(row.get("salePrice") or 1) == 0]
+
+    @staticmethod
+    def _dedupe_games(games):
+        unique = {}
+        for game in games:
+            key = re.sub(r"[^a-z0-9]", "", str(game.get("title", "")).lower())
+            if key and key not in unique:
+                unique[key] = game
+        return list(unique.values())
+
+    @staticmethod
+    def _game_date(value):
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
+        except ValueError:
+            try:
+                return datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            except ValueError:
+                return None
+
+    async def fetch_free_games(self, settings=None):
+        enabled = set((settings or {}).get("sources") or ["gamerpower", "epic", "cheapshark"])
+        urls = {"gamerpower": GAME_API + "?sort-by=date", "epic": EPIC_API, "cheapshark": CHEAPSHARK_API}
+        async with aiohttp.ClientSession(headers={"User-Agent": "GIR Discord Bot/1.0"}) as session:
+            results = await asyncio.gather(*(self._fetch_json(session, name, url) for name, url in urls.items() if name in enabled))
+        games = []
+        for name, payload in results:
+            if isinstance(payload, Exception):
+                self.game_provider_health[name] = "Unavailable"
+                continue
+            self.game_provider_health[name] = f"OK · {len(payload.get('data', {}).get('Catalog', {}).get('searchStore', {}).get('elements', [])) if name == 'epic' else len(payload)} records"
+            if name == "gamerpower":
+                # Preserve GamerPower's historical IDs so upgrades do not repost every active offer.
+                games.extend({**item, "id": str(item.get("id")), "source": "GamerPower", "source_url": "https://www.gamerpower.com/"} for item in payload)
+            elif name == "epic":
+                games.extend(self._epic_games(payload))
+            elif name == "cheapshark":
+                games.extend(self._cheapshark_games(payload))
+        return self._dedupe_games(games)
 
     def filtered_games(self, games, settings):
         platforms = {str(value).lower() for value in settings.get("platforms", [])}
@@ -166,14 +244,18 @@ class CommunitySuite(commands.Cog):
         def active(game):
             if settings.get("includeExpired") or not game.get("end_date"):
                 return True
-            try:
-                end = datetime.strptime(game["end_date"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                return end > now
-            except (TypeError, ValueError):
-                return True
+            end = self._game_date(game["end_date"])
+            return end is None or end > now
+
+        aliases = {"epic-games-store": "epic games store", "ps4": "playstation 4", "ps5": "playstation 5",
+                   "xbox-one": "xbox one", "xbox-series-xs": "xbox series x/s", "itchio": "itch.io"}
+
+        def platform_matches(game):
+            offered = {part.strip().lower() for part in str(game.get("platforms", "")).split(",")}
+            return not platforms or any((value == "pc" and "pc" in offered) or aliases.get(value, value) in offered for value in platforms)
 
         return [game for game in games
-                if (not platforms or any(platform in str(game.get("platforms", "")).lower() for platform in platforms))
+                if platform_matches(game)
                 and (not types or str(game.get("type", "")).lower() in types)
                 and worth(game) >= minimum_worth
                 and (not settings.get("hideUnrated") or worth(game) > 0)
@@ -182,13 +264,16 @@ class CommunitySuite(commands.Cog):
     @tasks.loop(minutes=15)
     async def free_game_check(self):
         settings = self.settings()["freeGames"]
+        minutes = min(1440, max(5, int(settings.get("checkMinutes", 15) or 15)))
+        if self.free_game_check.minutes != minutes:
+            self.free_game_check.change_interval(minutes=minutes)
         if not settings.get("enabled"):
             return
         channel = self.bot.get_channel(int(settings.get("channelID") or 0))
         if not channel:
             return
         try:
-            games = self.filtered_games(await self.fetch_free_games(), settings)
+            games = self.filtered_games(await self.fetch_free_games(settings), settings)
             try:
                 seen = set(json.loads(GAME_STATE_FILE.read_text()).get("seen", []))
             except (OSError, ValueError, TypeError):
@@ -208,22 +293,26 @@ class CommunitySuite(commands.Cog):
     async def before_free_game_check(self):
         await self.bot.wait_until_ready()
 
-    async def post_game(self, channel, game, settings):
+    @staticmethod
+    def game_embed(game):
         title = str(game.get("title", "Free game"))[:256]
         description = str(game.get("description", ""))[:2800]
         url = game.get("open_giveaway_url") or game.get("gamerpower_url") or "https://www.gamerpower.com/"
         embed = discord.Embed(title=title, url=url, description=description, color=discord.Color.green())
         embed.add_field(name="Platforms", value=str(game.get("platforms", "Unknown"))[:1024])
         embed.add_field(name="Normal price", value=str(game.get("worth") or "Unknown"))
-        try:
-            end_time = datetime.strptime(str(game.get("end_date")), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-            end_label = discord.utils.format_dt(end_time, "R")
-        except (TypeError, ValueError):
-            end_label = "While supplies last"
+        end_time = CommunitySuite._game_date(game.get("end_date"))
+        end_label = discord.utils.format_dt(end_time, "R") if end_time else "While supplies last"
         embed.add_field(name="Ends", value=end_label)
         if game.get("image") or game.get("thumbnail"):
             embed.set_image(url=game.get("image") or game.get("thumbnail"))
-        embed.add_field(name="Source", value="[Giveaway data from GamerPower](https://www.gamerpower.com/)", inline=False)
+        source = str(game.get("source") or "Giveaway source")
+        source_url = str(game.get("source_url") or url)
+        embed.add_field(name="Source", value=f"[{source}]({source_url})", inline=False)
+        return embed
+
+    async def post_game(self, channel, game, settings):
+        embed = self.game_embed(game)
         role_id = int(settings.get("pingRoleID") or 0); role = channel.guild.get_role(role_id)
         mentions = discord.AllowedMentions(roles=[role] if role else False, users=False, everyone=False)
         await channel.send(content=role.mention if role else None, embed=embed, allowed_mentions=mentions)
@@ -456,8 +545,10 @@ class CommunitySuite(commands.Cog):
 
     @app_commands.default_permissions(manage_messages=True)
     @app_commands.guilds(cfg.guild_id)
-    @app_commands.command(name="announce", description="Post a clear announcement in a channel")
-    async def announce(self, interaction: discord.Interaction, channel: discord.TextChannel, title: str, message: str, color: str = "5865F2"):
+    @app_commands.command(name="announce", description="Create and post a custom embed in a channel")
+    async def announce(self, interaction: discord.Interaction, channel: discord.TextChannel, title: str, message: str,
+                       color: str = "5865F2", image_url: str | None = None,
+                       thumbnail_url: str | None = None, footer: str | None = None):
         color_value = color.lstrip("#")
         try:
             if len(color_value) != 6:
@@ -465,9 +556,17 @@ class CommunitySuite(commands.Cog):
             embed_color = discord.Color(int(color_value, 16))
         except ValueError:
             await interaction.response.send_message("Use a six-character color such as 5865F2.", ephemeral=True); return
+        for label, value in (("image", image_url), ("thumbnail", thumbnail_url)):
+            if value and not value.startswith("https://"):
+                await interaction.response.send_message(f"The {label} must use an HTTPS link.", ephemeral=True); return
         embed = discord.Embed(title=title[:256], description=message[:4000], color=embed_color, timestamp=datetime.now(timezone.utc))
-        embed.set_footer(text=f"Posted by {interaction.user.display_name}")
-        await channel.send(embed=embed); await interaction.response.send_message("Announcement posted.", ephemeral=True)
+        if image_url:
+            embed.set_image(url=image_url)
+        if thumbnail_url:
+            embed.set_thumbnail(url=thumbnail_url)
+        embed.set_footer(text=(footer or f"Posted by {interaction.user.display_name}")[:2048])
+        await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        await interaction.response.send_message("Embed posted.", ephemeral=True)
 
     @app_commands.default_permissions(manage_channels=True)
     @app_commands.guilds(cfg.guild_id)
@@ -525,14 +624,14 @@ class CommunitySuite(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         settings = self.settings()["freeGames"]
         try:
-            games = self.filtered_games(await self.fetch_free_games(), settings)[:10]
+            games = self.filtered_games(await self.fetch_free_games(settings), settings)[:10]
         except Exception:
             await interaction.followup.send("I could not reach the free-game list right now.", ephemeral=True); return
         if not games:
             await interaction.followup.send("No matching giveaways are listed right now.", ephemeral=True); return
         lines = [f"• [{game.get('title', 'Free game')}]({game.get('open_giveaway_url') or game.get('gamerpower_url')}) — {game.get('platforms', 'Unknown platform')}" for game in games]
         embed = discord.Embed(title="Free games available now", description="\n".join(lines)[:4000], color=discord.Color.green())
-        embed.add_field(name="Source", value="[Giveaway data from GamerPower](https://www.gamerpower.com/)")
+        embed.add_field(name="Sources", value=", ".join(sorted({str(game.get("source", "Unknown")) for game in games})))
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @games.command(name="status", description="Show how free-game alerts are configured")
@@ -545,7 +644,10 @@ class CommunitySuite(commands.Cog):
         embed.add_field(name="Platforms", value=", ".join(settings.get("platforms", [])) or "All", inline=False)
         embed.add_field(name="Offer types", value=", ".join(settings.get("types", [])) or "All")
         embed.add_field(name="Minimum normal price", value=f"${float(settings.get('minimumWorth', 0) or 0):.2f}")
-        embed.set_footer(text="Giveaway data provided by GamerPower")
+        embed.add_field(name="Check schedule", value=f"Every {int(settings.get('checkMinutes', 15))} minutes")
+        health = "\n".join(f"**{name.title()}**: {state}" for name, state in sorted(self.game_provider_health.items()))
+        if health:
+            embed.add_field(name="Source health", value=health[:1024], inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     movie = app_commands.Group(name="movie", description="Plan a server movie night", guild_ids=[cfg.guild_id])
