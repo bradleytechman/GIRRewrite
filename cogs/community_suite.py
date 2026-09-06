@@ -570,6 +570,36 @@ class CommunitySuite(commands.Cog):
         if not sticker: await interaction.response.send_message("I could not find that sticker.", ephemeral=True); return
         await sticker.delete(reason=f"Deleted by {interaction.user}"); await interaction.response.send_message(f"Deleted `{name}`.", ephemeral=True)
 
+    @sticker.command(name="export", description="Export server stickers as a ZIP file")
+    async def sticker_export(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True); archive = BytesIO(); stickers = await interaction.guild.fetch_stickers()
+        async with aiohttp.ClientSession() as session:
+            with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
+                for item in stickers:
+                    try:
+                        async with session.get(item.url, timeout=15) as response: data = await response.read()
+                        extension = ".png" if item.format in {discord.StickerFormatType.png, discord.StickerFormatType.apng} else ".json"
+                        bundle.writestr(item.name + extension, data)
+                    except Exception: pass
+        archive.seek(0); await interaction.followup.send(file=discord.File(archive, filename=f"{interaction.guild.name}-stickers.zip"), ephemeral=True)
+
+    @sticker.command(name="import", description="Import PNG or APNG stickers from a ZIP")
+    async def sticker_import(self, interaction: discord.Interaction, file: discord.Attachment):
+        if file.size > 8 * 1024 * 1024: await interaction.response.send_message("Choose a ZIP smaller than 8 MB.", ephemeral=True); return
+        await interaction.response.defer(ephemeral=True); added = 0
+        try:
+            with zipfile.ZipFile(BytesIO(await file.read())) as bundle:
+                safe = [info for info in bundle.infolist() if not info.is_dir() and info.file_size <= 512*1024 and info.filename.lower().endswith((".png", ".apng"))][:15]
+                for info in safe:
+                    name = re.sub(r"[^A-Za-z0-9_ ]", "", Path(info.filename).stem)[:30]
+                    if len(name) < 2: continue
+                    try:
+                        upload = discord.File(BytesIO(bundle.read(info)), filename=Path(info.filename).name)
+                        await interaction.guild.create_sticker(name=name, description="Imported by GIR", emoji="⭐", file=upload, reason=f"Imported by {interaction.user}"); added += 1
+                    except discord.HTTPException: pass
+        except (zipfile.BadZipFile, OSError): await interaction.followup.send("That file is not a readable ZIP.", ephemeral=True); return
+        await interaction.followup.send(f"Imported **{added}** stickers.", ephemeral=True)
+
 
 async def setup(bot):
     await bot.add_cog(CommunitySuite(bot))
