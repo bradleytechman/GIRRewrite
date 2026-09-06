@@ -1,9 +1,13 @@
 """Pure detection helpers for the community suite."""
 import re
+import unicodedata
 from typing import Optional
 
 
-INVITE_PATTERN = re.compile(r"(?:discord\.gg|discord(?:app)?\.com/invite)/[A-Za-z0-9-]+", re.I)
+INVITE_PATTERN = re.compile(
+    r"(?:discord\.gg/(?:invite/)?|discord(?:app)?\.com/invite/|(?:dsc|invite)\.gg/|discord\.(?:io|li|me|st)/)[A-Za-z0-9-]{2,}",
+    re.I,
+)
 IMAGE_EXTENSIONS = {".avif", ".gif", ".heic", ".heif", ".jpeg", ".jpg", ".png", ".webp"}
 URL_PATTERN = re.compile(r"(?:https?://|www\.)\S+", re.I)
 SCAM_BRANDS = re.compile(r"\b(mr\s*beast|discord|steam|paypal|cash\s*app|coinbase|apple|microsoft|xbox|playstation)\b", re.I)
@@ -16,7 +20,20 @@ INVISIBLE_CHARACTERS = re.compile(r"[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\
 
 
 def normalize_obfuscated_text(text: str) -> str:
-    return INVISIBLE_CHARACTERS.sub("", str(text or ""))
+    normalized = unicodedata.normalize("NFKC", str(text or ""))
+    return "".join(character for character in normalized
+                   if unicodedata.category(character) not in {"Cf", "Cc"})
+
+
+def has_hidden_invite(text: str) -> bool:
+    """Detect an invite that only appears after removing hiding characters."""
+    original = str(text or "")
+    return has_invite(normalize_obfuscated_text(original)) and not has_invite(original)
+
+
+def has_suspicious_image_name(filename: str) -> bool:
+    """Match the generic numbered image name used by a recurring compromise campaign."""
+    return bool(re.fullmatch(r"1\.[A-Za-z0-9]{1,10}", str(filename or "").casefold()))
 
 
 def caps_percent(text: str) -> int:

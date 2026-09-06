@@ -27,7 +27,9 @@ from discord.ext import commands, tasks
 
 from utils import cfg, logger
 from utils.framework.permissions import gatekeeper
-from community_rules import caps_percent, detect_scam, has_invite, is_image_attachment, normalize_obfuscated_text, recent_count
+from community_rules import (caps_percent, detect_scam, has_hidden_invite, has_invite,
+                             has_suspicious_image_name, is_image_attachment,
+                             normalize_obfuscated_text, recent_count)
 
 
 DATA_FILE = Path(os.environ.get(
@@ -48,7 +50,8 @@ DEFAULTS = {
         "imageWindowSeconds": 20, "fastSpam": True, "messageThreshold": 7,
         "messageWindowSeconds": 8, "capsSpam": True, "capsPercent": 80,
         "mentionSpam": True, "mentionThreshold": 6, "inviteLinks": False,
-        "scamDetection": True, "scamTimeoutHours": 168,
+        "scamDetection": True, "scamTimeoutHours": 168, "hiddenInvites": True,
+        "suspiciousImageNames": True,
         "monitorAllChannels": True, "monitoredChannelIDs": [], "ignoredChannelIDs": [], "ignoredRoleIDs": [],
     },
     "reports": {"pingModeratorRole": True, "pingAdministratorRole": False, "pingRoleIDs": [],
@@ -581,15 +584,28 @@ class CommunitySuite(commands.Cog):
             await self._moderate(message, scam_rule, scam_reason)
             return
 
+        if (settings["automod"].get("hiddenInvites", True) and has_hidden_invite(message.content)
+                and not gatekeeper.has(message.guild, message.author, 1)):
+            hidden_rule = dict(settings["automod"])
+            hidden_rule.update({"deleteMessage": True, "timeoutHours": 168})
+            await self._moderate(message, hidden_rule,
+                                 "Discord invite obscured with invisible or compatibility characters")
+            return
+
         # Prevent image dumps from accounts that have not reached Member+.
         # This focused safety rule stays active when general AutoMod is off.
         image_attachments = [attachment for attachment in message.attachments
                              if is_image_attachment(attachment.content_type, attachment.filename)]
-        if len(image_attachments) >= 4 and not gatekeeper.has(message.guild, message.author, 1):
+        suspicious_names = [attachment.filename for attachment in image_attachments
+                            if has_suspicious_image_name(attachment.filename)]
+        suspicious_name = settings["automod"].get("suspiciousImageNames", True) and suspicious_names
+        if (len(image_attachments) >= 4 or suspicious_name) and not gatekeeper.has(message.guild, message.author, 1):
             image_rule = dict(settings["automod"])
             image_rule.update({"deleteMessage": True, "timeoutHours": 168})
-            await self._moderate(message, image_rule,
-                                 f"{len(image_attachments)} images in one message from a user below Member+")
+            trigger = (f"{len(image_attachments)} images in one message from a user below Member+"
+                       if len(image_attachments) >= 4 else
+                       f"Suspicious campaign image filename: {suspicious_names[0]}")
+            await self._moderate(message, image_rule, trigger)
             return
 
         if message.author.id in self.afk:
@@ -670,7 +686,34 @@ class CommunitySuite(commands.Cog):
         if guild.id == cfg.guild_id:
             self._observe_identity(user, "banned", force=True)
 
+    async def _preserve_image_evidence(self, message: discord.Message, maximum: int) -> list[discord.File]:
+        images = [item for item in message.attachments
+                  if is_image_attachment(item.content_type, item.filename)][:maximum]
+        if not images:
+            return []
+        files = []
+        timeout = aiohttp.ClientTimeout(total=12)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for index, item in enumerate(images, 1):
+                try:
+                    async with session.get(item.url) as response:
+                        response.raise_for_status()
+                        data = await response.content.read(8 * 1024 * 1024 + 1)
+                    if len(data) > 8 * 1024 * 1024:
+                        logger.warning("Skipped oversized moderation evidence attachment %s", item.id)
+                        continue
+                    suffix = Path(item.filename).suffix.casefold()
+                    suffix = suffix if re.fullmatch(r"\.[a-z0-9]{1,10}", suffix) else ".png"
+                    files.append(discord.File(BytesIO(data), filename=f"evidence-{index}{suffix}"))
+                except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+                    logger.warning("Could not preserve moderation evidence attachment %s", item.id)
+        return files
+
     async def _moderate(self, message: discord.Message, settings: dict, trigger: str):
+        report_settings = self.settings().get("reports", {})
+        maximum = max(1, min(4, int(report_settings.get("maxLogImages", 4))))
+        evidence = (await self._preserve_image_evidence(message, maximum)
+                    if report_settings.get("includeImages", True) else [])
         if settings.get("deleteMessage"):
             try:
                 await message.delete()
@@ -700,21 +743,27 @@ class CommunitySuite(commands.Cog):
         embed.add_field(name="Trigger", value=trigger, inline=True)
         embed.add_field(name="Action", value=action, inline=False)
         embed.add_field(name="Campaign group", value=f"`{group}` · {len(self.report_batches[group])} account(s)", inline=False)
-        report_settings = self.settings().get("reports", {})
-        if message.attachments and report_settings.get("includeImages", True):
+        if evidence:
+            embed.set_image(url=f"attachment://{evidence[0].filename}")
+        elif message.attachments and report_settings.get("includeImages", True):
             embed.set_image(url=message.attachments[0].url)
         view = discord.ui.View(timeout=None)
         view.add_item(discord.ui.Button(label="Ban", style=discord.ButtonStyle.danger, custom_id=f"gir:report:ban:{message.author.id}"))
         view.add_item(discord.ui.Button(label="Ban matching", style=discord.ButtonStyle.danger, custom_id=f"gir:report:banbatch:{group}"))
         view.add_item(discord.ui.Button(label="Dismiss", style=discord.ButtonStyle.secondary, custom_id=f"gir:report:dismiss:{message.author.id}"))
         content, mentions = self._report_mentions(message.guild)
-        maximum = max(1, min(10, int(report_settings.get("maxLogImages", 4))))
         extras = []
-        if report_settings.get("includeImages", True):
+        if evidence:
+            for item in evidence[1:]:
+                extra = discord.Embed(url=message.jump_url)
+                extra.set_image(url=f"attachment://{item.filename}")
+                extras.append(extra)
+        elif report_settings.get("includeImages", True):
             for item in message.attachments[1:maximum]:
-                if (item.content_type or "").startswith("image/"):
+                if is_image_attachment(item.content_type, item.filename):
                     extra = discord.Embed(url=message.jump_url); extra.set_image(url=item.url); extras.append(extra)
-        await channel.send(content=content, embeds=[embed, *extras], view=view, allowed_mentions=mentions)
+        await channel.send(content=content, embeds=[embed, *extras], files=evidence,
+                           view=view, allowed_mentions=mentions)
 
     @commands.Cog.listener()
     async def on_interaction(self, interaction: discord.Interaction):
