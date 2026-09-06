@@ -28,7 +28,7 @@ default_extensions = [
 ]
 
 feature_file = Path(os.environ.get(
-    "GIR_FEATURE_FILE", "/Volumes/4TB/Services/GIR/dashboard/data/features.json"))
+    "GIR_FEATURE_FILE", str(Path.home() / "Library/Application Support/SowensServer/GIRRuntime/dashboard/data/features.json")))
 try:
     enabled_extensions = set(json.loads(feature_file.read_text()).get("enabled", []))
     initial_extensions = [name for name in default_extensions if name in enabled_extensions]
