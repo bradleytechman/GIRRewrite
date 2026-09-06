@@ -49,6 +49,10 @@ DEFAULTS = {
         "scamDetection": True, "scamTimeoutHours": 168,
         "monitorAllChannels": True, "monitoredChannelIDs": [], "ignoredChannelIDs": [], "ignoredRoleIDs": [],
     },
+    "reports": {"pingModeratorRole": True, "pingAdministratorRole": False, "pingRoleIDs": [],
+                "pingUserIDs": [], "allowEveryone": True, "allowedRoleIDs": [], "allowedUserIDs": [],
+                "ignoredUserIDs": [], "ignoredMessageIDs": [], "ignoredChannelIDs": [],
+                "ignoredThreadIDs": [], "joinThreadsWhenMentioned": True, "notifyOnIgnoredPing": False},
     "welcome": {"enabled": False, "channelID": 0, "message": "Welcome {mention} to {server}!", "goodbyeEnabled": False, "goodbyeMessage": "{name} left the server."},
     "autorole": {"enabled": False, "roleIDs": []},
     "starboard": {"enabled": False, "channelID": 0, "threshold": 3, "emoji": "⭐"},
@@ -448,6 +452,42 @@ class CommunitySuite(commands.Cog):
         ignored = set(settings.get("ignoredRoleIDs", []))
         return member.guild_permissions.manage_messages or any(role.id in ignored for role in member.roles)
 
+    @staticmethod
+    def _ids(values):
+        return {int(value) for value in values if str(value).isdigit()}
+
+    def _ignored(self, message: discord.Message) -> bool:
+        rules = self.settings().get("reports", {})
+        channel_ids = {message.channel.id, int(getattr(message.channel, "parent_id", 0) or 0)}
+        return (message.author.id in self._ids(rules.get("ignoredUserIDs", []))
+                or message.id in self._ids(rules.get("ignoredMessageIDs", []))
+                or bool(channel_ids & self._ids(rules.get("ignoredChannelIDs", [])))
+                or message.channel.id in self._ids(rules.get("ignoredThreadIDs", [])))
+
+    def _report_access(self, member: discord.Member) -> bool:
+        rules = self.settings().get("reports", {})
+        return (rules.get("allowEveryone", True) or member.guild_permissions.manage_messages
+                or member.id in self._ids(rules.get("allowedUserIDs", []))
+                or bool({role.id for role in member.roles} & self._ids(rules.get("allowedRoleIDs", []))))
+
+    def _report_mentions(self, guild: discord.Guild):
+        rules = self.settings().get("reports", {})
+        role_ids = self._ids(rules.get("pingRoleIDs", []))
+        if rules.get("pingModeratorRole", True):
+            role_ids.add(int(getattr(cfg.roles, "moderator", 0) or 0))
+        if rules.get("pingAdministratorRole", False):
+            role_ids.add(int(getattr(cfg.roles, "administrator", 0) or 0))
+        roles = [guild.get_role(value) for value in role_ids]
+        roles = [role for role in roles if role]
+        users = [guild.get_member(value) for value in self._ids(rules.get("pingUserIDs", []))]
+        users = [user for user in users if user]
+        content = " ".join([role.mention for role in roles] + [user.mention for user in users])
+        return content or None, discord.AllowedMentions(roles=roles, users=users, everyone=False)
+
+    def _report_channel(self, guild: discord.Guild):
+        configured = int(self.settings().get("automod", {}).get("reportChannelID", 0) or 0)
+        return (guild.get_channel(configured) if configured else None) or discord.utils.get(guild.text_channels, name="reports") or guild.get_channel(int(getattr(cfg.channels, "reports", 0) or 0))
+
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
         settings = self.settings()
@@ -483,6 +523,17 @@ class CommunitySuite(commands.Cog):
             "jumpURL": message.jump_url, "attachments": [item.url for item in message.attachments]})
         settings = self.settings()
         lowered = message.content.lower().strip()
+
+        if (isinstance(message.channel, discord.Thread) and self.bot.user in message.mentions
+                and settings.get("reports", {}).get("joinThreadsWhenMentioned", True)):
+            try:
+                await message.channel.join()
+                if settings.get("reports", {}).get("notifyOnIgnoredPing", False):
+                    await message.reply("I joined this thread and can monitor it now.", mention_author=False)
+            except discord.HTTPException:
+                logger.warning("GIR could not join mentioned thread %s", message.channel.id)
+        if self._ignored(message):
+            return
 
         attachment_text = " ".join(f"{item.filename} {getattr(item, 'description', '') or ''}" for item in message.attachments)
         scam_reason = detect_scam(f"{message.content} {attachment_text}")
@@ -585,10 +636,7 @@ class CommunitySuite(commands.Cog):
                 action = f"Timed out for {hours} hours"
             except discord.HTTPException:
                 action = "Message removed; timeout could not be applied"
-        report_id = int(settings.get("reportChannelID") or 0)
-        channel = message.guild.get_channel(report_id) if report_id else None
-        channel = channel or discord.utils.get(message.guild.text_channels, name="reports")
-        channel = channel or message.guild.get_channel(int(getattr(cfg.channels, "reports", 0) or 0))
+        channel = self._report_channel(message.guild)
         if not channel:
             return
         embed = discord.Embed(title="🚨 Automatic moderation alert", color=discord.Color.red(), timestamp=datetime.now(timezone.utc))
@@ -601,7 +649,8 @@ class CommunitySuite(commands.Cog):
         view = discord.ui.View(timeout=None)
         view.add_item(discord.ui.Button(label="Ban", style=discord.ButtonStyle.danger, custom_id=f"gir:report:ban:{message.author.id}"))
         view.add_item(discord.ui.Button(label="Dismiss", style=discord.ButtonStyle.secondary, custom_id=f"gir:report:dismiss:{message.author.id}"))
-        await channel.send(embed=embed, view=view)
+        content, mentions = self._report_mentions(message.guild)
+        await channel.send(content=content, embed=embed, view=view, allowed_mentions=mentions)
 
     @commands.Cog.listener()
     async def on_interaction(self, interaction: discord.Interaction):
@@ -747,13 +796,34 @@ class CommunitySuite(commands.Cog):
     @app_commands.guilds(cfg.guild_id)
     @app_commands.command(name="report", description="Privately report a member to the moderation team")
     async def report(self, interaction: discord.Interaction, member: discord.Member, reason: str):
-        channel = interaction.guild.get_channel(int(getattr(cfg.channels, "reports", 0)))
+        channel = self._report_channel(interaction.guild)
         if not channel:
             await interaction.response.send_message("The reports channel is not set up yet.", ephemeral=True); return
+        if not self._report_access(interaction.user):
+            await interaction.response.send_message("You are not in a role allowed to submit reports.", ephemeral=True); return
         embed = discord.Embed(title="Member report", description=reason[:4000], color=discord.Color.orange(), timestamp=datetime.now(timezone.utc))
         embed.add_field(name="Reported member", value=f"{member.mention}\n`{member.id}`")
         embed.add_field(name="Reported by", value=f"{interaction.user.mention}\n`{interaction.user.id}`")
-        await channel.send(embed=embed); await interaction.response.send_message("Your report was sent privately to the moderators.", ephemeral=True)
+        content, mentions = self._report_mentions(interaction.guild)
+        await channel.send(content=content, embed=embed, allowed_mentions=mentions); await interaction.response.send_message("Your report was sent privately to the moderators.", ephemeral=True)
+
+    @app_commands.guilds(cfg.guild_id)
+    @app_commands.context_menu(name="Report message")
+    async def report_message(self, interaction: discord.Interaction, message: discord.Message):
+        if not self._report_access(interaction.user):
+            await interaction.response.send_message("You are not in a role allowed to report messages.", ephemeral=True); return
+        if self._ignored(message):
+            await interaction.response.send_message("GIR is configured to ignore that message, person, channel, or thread.", ephemeral=True); return
+        channel = self._report_channel(interaction.guild)
+        if not channel:
+            await interaction.response.send_message("The reports channel is not set up yet.", ephemeral=True); return
+        embed = discord.Embed(title="Message reported", description=(message.content or "No message text")[:3500], color=discord.Color.orange(), timestamp=datetime.now(timezone.utc))
+        embed.add_field(name="Message author", value=f"{message.author.mention}\n`{message.author.id}`", inline=True)
+        embed.add_field(name="Reported by", value=f"{interaction.user.mention}\n`{interaction.user.id}`", inline=True)
+        embed.add_field(name="Location", value=f"{message.channel.mention}\n[Open message]({message.jump_url})", inline=False)
+        content, mentions = self._report_mentions(interaction.guild)
+        await channel.send(content=content, embed=embed, allowed_mentions=mentions)
+        await interaction.response.send_message("That message was sent privately to the moderation team.", ephemeral=True)
 
     @app_commands.guilds(cfg.guild_id)
     @app_commands.command(name="afk", description="Let people know you are away")
