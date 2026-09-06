@@ -160,12 +160,33 @@ class ServerSuite(commands.Cog):
             async with session.get(url, timeout=25) as response:
                 response.raise_for_status(); return await response.json()
 
+    async def _get_devices(self):
+        now = asyncio.get_running_loop().time()
+        if self._devices and now - self._device_cache_time < 3600:
+            return self._devices
+        self._devices = await self._get_json(IPSW_API + "/devices")
+        self._device_cache_time = now
+        return self._devices
+
+    @staticmethod
+    def _normalise_device_name(value: str):
+        value = value.casefold().replace("‑", "-")
+        value = re.sub(r"\b(1st|2nd|3rd|([4-9]|\d{2,})th)\s+(generation|gen)\b", r"\1", value)
+        value = re.sub(r"\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+(generation|gen)\b", r"\1", value)
+        number_words = {"first": "1", "second": "2", "third": "3", "fourth": "4", "fifth": "5",
+                        "sixth": "6", "seventh": "7", "eighth": "8", "ninth": "9", "tenth": "10"}
+        for word, number in number_words.items():
+            value = re.sub(rf"\b{word}\b", number, value)
+        value = re.sub(r"(\d+)(st|nd|rd|th)\b", r"\1", value)
+        return re.sub(r"[^a-z0-9]+", " ", value).strip()
+
     async def _find_device(self, device_text: str):
-        devices = await self._get_json(IPSW_API + "/devices")
-        names = {str(item["name"]).lower(): item for item in devices}
-        identifiers = {str(item["identifier"]).lower(): item for item in devices}
-        needle = device_text.strip().lower()
-        device = names.get(needle) or identifiers.get(needle)
+        devices = await self._get_devices()
+        names = {self._normalise_device_name(str(item["name"])): item for item in devices}
+        identifiers = {str(item["identifier"]).casefold(): item for item in devices}
+        raw = device_text.strip().casefold()
+        needle = self._normalise_device_name(device_text)
+        device = names.get(needle) or identifiers.get(raw)
         if not device:
             match = difflib.get_close_matches(needle, list(names) + list(identifiers), n=1, cutoff=.58)
             device = (names.get(match[0]) or identifiers.get(match[0])) if match else None
@@ -173,14 +194,12 @@ class ServerSuite(commands.Cog):
             raise ValueError(f"I could not match “{device_text}” to an Apple device.")
         return device
 
-    async def _resolve_signing(self, question: str):
-        version_match = re.search(r"(?:ios\s*)?(\d+(?:\.\d+){1,2})", question, re.I)
-        device_text = re.split(r"\bfor\b", question, flags=re.I)[-1].strip(" ?.!")
-        device_text = re.sub(r"\b(is|signed|signing|ios|ipados)\b|\d+(?:\.\d+){1,2}", " ", device_text, flags=re.I).strip()
-        if not version_match or not device_text:
-            raise ValueError("Ask like: Is iOS 17.1 signed for iPhone 16?")
+    async def _check_signing(self, device_text: str, version: str):
+        version_match = re.search(r"\d+(?:\.\d+){1,2}", version)
+        if not version_match:
+            raise ValueError("Enter an iOS version such as 18.6 or 26.0.")
         device = await self._find_device(device_text)
-        version = version_match.group(1)
+        version = version_match.group(0)
         data = await self._get_json(f"{IPSW_API}/device/{device['identifier']}?type=ipsw")
         firmware = next((item for item in data.get("firmwares", []) if item.get("version") == version), None)
         if not firmware:
@@ -202,22 +221,27 @@ class ServerSuite(commands.Cog):
                     try:
                         output, _ = await asyncio.wait_for(process.communicate(), timeout=45)
                     except asyncio.TimeoutError:
-                        process.kill()
-                        await process.communicate()
-                        raise
+                        process.kill(); await process.communicate(); raise
                 text = output.decode(errors="replace")
                 if "IS being signed" in text: result = True
                 elif "IS NOT being signed" in text: result = False
             except (OSError, asyncio.TimeoutError):
                 logger.exception("TSSChecker signing request failed")
             finally:
-                if work_dir:
-                    shutil.rmtree(work_dir, ignore_errors=True)
+                if work_dir: shutil.rmtree(work_dir, ignore_errors=True)
         catalog_signed = bool(firmware.get("signed"))
         if result is not None and result != catalog_signed:
             return device, version, "uncertain", "TSSChecker and the firmware catalog disagree. Try again later before restoring."
         signed = catalog_signed if result is None else result
         return device, version, "signed" if signed else "unsigned", "Checked with TSSChecker and Apple's signing data."
+
+    async def _resolve_signing(self, question: str):
+        version_match = re.search(r"(?:ios\s*)?(\d+(?:\.\d+){1,2})", question, re.I)
+        device_text = re.split(r"\bfor\b", question, flags=re.I)[-1].strip(" ?.!")
+        device_text = re.sub(r"\b(is|signed|signing|ios|ipados)\b|\d+(?:\.\d+){1,2}", " ", device_text, flags=re.I).strip()
+        if not version_match or not device_text:
+            raise ValueError("Ask like: Is iOS 17.1 signed for iPhone 16?")
+        return await self._check_signing(device_text, version_match.group(1))
 
     async def _current_signing_summary(self):
         """Return a useful live result when /tss check has no question."""
@@ -248,18 +272,15 @@ class ServerSuite(commands.Cog):
             timestamp=datetime.now(timezone.utc),
         ).set_footer(text="Live result from Apple's firmware signing catalog via IPSW.me")
 
-    @tss.command(name="check", description="Check signing now, or ask about a version and device")
-    @app_commands.describe(question="Example: Is iOS 17.1 signed for iPhone 16?")
-    async def tss_check(self, interaction: discord.Interaction, question: str = ""):
+    @tss.command(name="check", description="Check whether an iOS version is signed for a device")
+    @app_commands.describe(
+        device="Apple device name or identifier, such as iPhone X or iPhone10,3",
+        ios_version="iOS or iPadOS version, such as 16.7.12 or 26.0",
+    )
+    async def tss_check(self, interaction: discord.Interaction, device: str, ios_version: str):
         await interaction.response.defer()
-        if not question.strip():
-            try:
-                await interaction.followup.send(embed=await self._current_signing_summary())
-            except aiohttp.ClientError:
-                await interaction.followup.send("I could not reach Apple's firmware signing catalog right now.", ephemeral=True)
-            return
         try:
-            device, version, status_code, note = await self._resolve_signing(question)
+            device, version, status_code, note = await self._check_signing(device, ios_version)
         except (ValueError, aiohttp.ClientError) as error:
             await interaction.followup.send(str(error), ephemeral=True); return
         status, color = {
@@ -271,6 +292,40 @@ class ServerSuite(commands.Cog):
                               timestamp=datetime.now(timezone.utc))
         embed.add_field(name="Device identifier", value=device["identifier"])
         await interaction.followup.send(embed=embed)
+
+    @tss_check.autocomplete("device")
+    async def tss_device_autocomplete(self, interaction: discord.Interaction, current: str):
+        try:
+            devices = await self._get_devices()
+        except aiohttp.ClientError:
+            return []
+        needle = self._normalise_device_name(current)
+        ranked = []
+        for item in devices:
+            name = str(item.get("name", ""))
+            identifier = str(item.get("identifier", ""))
+            haystack = self._normalise_device_name(f"{name} {identifier}")
+            if needle and needle not in haystack:
+                continue
+            family_rank = 0 if name.startswith(("iPhone", "iPad")) else 1
+            ranked.append((family_rank, name.casefold(), name, identifier))
+        ranked.sort()
+        return [app_commands.Choice(name=f"{name} · {identifier}"[:100], value=identifier[:100])
+                for _, _, name, identifier in ranked[:25]]
+
+    @tss_check.autocomplete("ios_version")
+    async def tss_version_autocomplete(self, interaction: discord.Interaction, current: str):
+        device_text = str(getattr(interaction.namespace, "device", "") or "")
+        if not device_text:
+            return []
+        try:
+            device = await self._find_device(device_text)
+            data = await self._get_json(f"{IPSW_API}/device/{device['identifier']}?type=ipsw")
+        except (ValueError, aiohttp.ClientError):
+            return []
+        versions = list(dict.fromkeys(str(item.get("version")) for item in data.get("firmwares", []) if item.get("version")))
+        matches = [version for version in versions if not current or version.startswith(current.strip())]
+        return [app_commands.Choice(name=version, value=version) for version in matches[:25]]
 
     @tss.command(name="device", description="Find the identifier GIR uses for an Apple device")
     async def tss_device(self, interaction: discord.Interaction, device: str):
@@ -307,7 +362,7 @@ class ServerSuite(commands.Cog):
     async def tss_help(self, interaction: discord.Interaction):
         await interaction.response.send_message(
             "**TSS commands**\n"
-            "`/tss check question:Is iOS 17.1 signed for iPhone 16?`\n"
+            "`/tss check device:iPhone 16 ios_version:18.0`\n"
             "`/tss device device:iPhone 16`\n"
             "`/tss versions device:iPhone 16`\n"
             "`/tss status`",
