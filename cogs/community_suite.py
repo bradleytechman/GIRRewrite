@@ -13,7 +13,7 @@ import re
 import zipfile
 from io import BytesIO
 import time
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -37,6 +37,10 @@ GAME_REQUEST_FILE = DATA_FILE.with_name("free-games-request.json")
 GAME_API = "https://www.gamerpower.com/api/giveaways"
 EPIC_API = "https://store-site-backend-static.ak.epicgames.com/freeGamesPromotions?locale=en-US&country=US&allowCountries=US"
 CHEAPSHARK_API = "https://www.cheapshark.com/api/1.0/deals?upperPrice=0&onSale=1&pageSize=60&sortBy=Recent"
+DEFAULT_GAME_FEEDS = [
+    "https://www.reddit.com/r/FreeGameFindings+FreeGamesOnSteam+GameDeals/.rss?limit=75",
+    "https://www.gamerpower.com/rss/pc",
+]
 
 DEFAULTS = {
     "automod": {
@@ -51,7 +55,7 @@ DEFAULTS = {
     "autorole": {"enabled": False, "roleIDs": []},
     "starboard": {"enabled": False, "channelID": 0, "threshold": 3, "emoji": "⭐"},
     "suggestions": {"enabled": False, "channelID": 0},
-    "freeGames": {"enabled": False, "channelID": 0, "platforms": ["pc", "steam", "epic-games-store", "ps4", "ps5", "xbox-one", "xbox-series-xs"], "types": ["game"], "sources": ["gamerpower", "epic", "cheapshark"], "checkMinutes": 15, "pingRoleID": 0, "minimumWorth": 0, "hideUnrated": False, "includeExpired": False, "maxPostsPerCheck": 5},
+    "freeGames": {"enabled": False, "channelID": 0, "platforms": ["pc", "steam", "epic-games-store", "ps4", "ps5", "xbox-one", "xbox-series-xs"], "types": ["game"], "sources": ["gamerpower", "epic", "cheapshark", "communityFeeds"], "communityFeedURLs": DEFAULT_GAME_FEEDS, "twitterAccounts": ["EpicGames", "GamerPowercom", "FreeGameFinding", "just_free_games"], "twitterBridge": "https://rsshub.app", "checkMinutes": 15, "pingRoleID": 0, "minimumWorth": 0, "hideUnrated": False, "includeExpired": False, "maxPostsPerCheck": 5},
     "movieNight": {"enabled": False, "channelID": 0, "pingRoleID": 0},
     "relay": {"enabled": False, "destinationGuildID": 0, "messages": True, "edits": True,
               "deletes": True, "reactions": True, "channelRoutes": []},
@@ -165,6 +169,39 @@ class CommunitySuite(commands.Cog):
             logger.warning("Free-game provider %s failed: %s", name, error)
             return name, error
 
+    async def _fetch_game_feed(self, session, name, url):
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as response:
+                response.raise_for_status(); root = ET.fromstring(await response.text())
+            games = []
+            for node in list(root.findall(".//item"))[:40] + list(root.findall("{*}entry"))[:40]:
+                def value(*tags):
+                    for tag in tags:
+                        child = node.find(tag)
+                        if child is not None:
+                            return child.get("href") or child.text or ""
+                    return ""
+                title = re.sub(r"<[^>]+>", "", value("title", "{*}title")).strip()
+                detail = re.sub(r"<[^>]+>", "", value("description", "{*}summary", "{*}content")).strip()
+                searchable = (title + " " + detail).lower()
+                category = node.find("{*}category")
+                subreddit = str(category.get("term", "")) if category is not None else ""
+                if (subreddit.lower() == "gamedeals" or name == "Reddit GameDeals" or name.startswith("X @")) and not re.search(r"\b(free|100% off|0\.00|giveaway)\b", searchable):
+                    continue
+                link = value("link", "{*}link")
+                identifier = value("guid", "{*}id") or link or title
+                platform = ("Steam, PC" if "steam" in searchable else "Epic Games Store, PC" if "epic" in searchable
+                            else "PlayStation 5, PlayStation 4" if re.search(r"\b(ps5|ps4|playstation)\b", searchable)
+                            else "Xbox Series X/S, Xbox One" if "xbox" in searchable else "Nintendo Switch" if "switch" in searchable else "PC")
+                offer_type = "loot" if re.search(r"\b(dlc|pack|loot|skin|key)\b", searchable) else "game"
+                games.append({"id": f"feed:{hashlib.sha256(identifier.encode()).hexdigest()}", "title": title,
+                    "description": detail[:900], "platforms": platform, "type": offer_type, "worth": "Unknown",
+                    "end_date": None, "open_giveaway_url": link, "source": f"Reddit r/{subreddit}" if subreddit else name, "source_url": url})
+            return name, games
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, ET.ParseError) as error:
+            logger.warning("Free-game feed %s failed: %s", name, error)
+            return name, error
+
     @staticmethod
     def _epic_games(payload):
         rows = payload.get("data", {}).get("Catalog", {}).get("searchStore", {}).get("elements", [])
@@ -217,10 +254,25 @@ class CommunitySuite(commands.Cog):
                 return None
 
     async def fetch_free_games(self, settings=None):
-        enabled = set((settings or {}).get("sources") or ["gamerpower", "epic", "cheapshark"])
+        settings = settings or {}
+        enabled = set(settings.get("sources") or ["gamerpower", "epic", "cheapshark", "communityFeeds"])
         urls = {"gamerpower": GAME_API + "?sort-by=date", "epic": EPIC_API, "cheapshark": CHEAPSHARK_API}
         async with aiohttp.ClientSession(headers={"User-Agent": "GIR Discord Bot/1.0"}) as session:
             results = await asyncio.gather(*(self._fetch_json(session, name, url) for name, url in urls.items() if name in enabled))
+            feed_jobs = []
+            if "communityFeeds" in enabled:
+                for url in settings.get("communityFeedURLs") or DEFAULT_GAME_FEEDS:
+                    if "FreeGameFindings+" in url: name = "Reddit free-game communities"
+                    elif "FreeGameFindings" in url: name = "Reddit FreeGameFindings"
+                    elif "FreeGamesOnSteam" in url: name = "Reddit FreeGamesOnSteam"
+                    elif "GameDeals" in url: name = "Reddit GameDeals"
+                    elif "gamerpower.com" in url: name = "GamerPower RSS"
+                    else: name = urlparse(url).hostname or "Community feed"
+                    feed_jobs.append(self._fetch_game_feed(session, name, url))
+                bridge = str(settings.get("twitterBridge") or "https://rsshub.app").rstrip("/")
+                for account in settings.get("twitterAccounts") or []:
+                    feed_jobs.append(self._fetch_game_feed(session, f"X @{account}", f"{bridge}/twitter/user/{quote(str(account).lstrip('@'))}"))
+            feed_results = await asyncio.gather(*feed_jobs)
         games = []
         for name, payload in results:
             if isinstance(payload, Exception):
@@ -234,6 +286,11 @@ class CommunitySuite(commands.Cog):
                 games.extend(self._epic_games(payload))
             elif name == "cheapshark":
                 games.extend(self._cheapshark_games(payload))
+        for name, payload in feed_results:
+            if isinstance(payload, Exception):
+                self.game_provider_health[name] = "Unavailable"
+            else:
+                self.game_provider_health[name] = f"OK · {len(payload)} matches"; games.extend(payload)
         return self._dedupe_games(games)
 
     def filtered_games(self, games, settings):
