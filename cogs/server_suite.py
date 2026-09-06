@@ -219,9 +219,45 @@ class ServerSuite(commands.Cog):
         signed = catalog_signed if result is None else result
         return device, version, "signed" if signed else "unsigned", "Checked with TSSChecker and Apple's signing data."
 
-    @tss.command(name="check", description="Ask naturally whether an iOS version is signed for a device")
-    async def tss_check(self, interaction: discord.Interaction, question: str):
+    async def _current_signing_summary(self):
+        """Return a useful live result when /tss check has no question."""
+        devices = await self._get_json(IPSW_API + "/devices")
+        preferred_names = ("iPhone 16", "iPhone 16 Pro", "iPhone 15", "iPad Pro 11-inch (M4)")
+        by_name = {str(item.get("name", "")).lower(): item for item in devices}
+        selected = [by_name[name.lower()] for name in preferred_names if name.lower() in by_name]
+        if not selected:
+            selected = [item for item in devices if str(item.get("name", "")).startswith("iPhone")][-4:]
+
+        async def signed_versions(device):
+            data = await self._get_json(f"{IPSW_API}/device/{device['identifier']}?type=ipsw")
+            versions = list(dict.fromkeys(
+                item.get("version") for item in data.get("firmwares", [])
+                if item.get("signed") and item.get("version")
+            ))
+            return device, versions
+
+        results = await asyncio.gather(*(signed_versions(device) for device in selected))
+        lines = [
+            f"**{device['name']}** (`{device['identifier']}`): " + (", ".join(versions[:8]) or "None reported")
+            for device, versions in results
+        ]
+        return discord.Embed(
+            title="Currently signed Apple firmware",
+            description="\n".join(lines),
+            color=discord.Color.green(),
+            timestamp=datetime.now(timezone.utc),
+        ).set_footer(text="Live result from Apple's firmware signing catalog via IPSW.me")
+
+    @tss.command(name="check", description="Check signing now, or ask about a version and device")
+    @app_commands.describe(question="Example: Is iOS 17.1 signed for iPhone 16?")
+    async def tss_check(self, interaction: discord.Interaction, question: str = ""):
         await interaction.response.defer()
+        if not question.strip():
+            try:
+                await interaction.followup.send(embed=await self._current_signing_summary())
+            except aiohttp.ClientError:
+                await interaction.followup.send("I could not reach Apple's firmware signing catalog right now.", ephemeral=True)
+            return
         try:
             device, version, status_code, note = await self._resolve_signing(question)
         except (ValueError, aiohttp.ClientError) as error:
