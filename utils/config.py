@@ -112,8 +112,11 @@ class Config:
         self.spotify_secret = os.environ.get("SPOTIFY_SECRET")
         self.spotify_playlist_url = os.environ.get("SPOTIFY_PLAYLIST_URL")
         self.spotify_auth_code = os.environ.get("SPOTIFY_AUTH_CODE")
+        self.lastfm_api_key = os.environ.get("LASTFM_API_KEY")
         if self.spotify_id is None or self.spotify_secret is None or self.spotify_playlist_url is None:
             logger.warning("Adding songs to public Spotify playlist disabled.")
+        if self.lastfm_api_key is None:
+            logger.warning("Last.fm commands are installed but need LASTFM_API_KEY to return listening history.")
 
         self.roles = Roles()
         self.channels = Channels()

@@ -8,6 +8,7 @@ from pathlib import Path
 default_extensions = [
     "cogs.community_suite",
     "cogs.server_suite",
+    "cogs.music_suite",
     "cogs.commands.info.stats",
     "cogs.commands.info.help",
     "cogs.commands.info.tags",
