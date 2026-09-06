@@ -8,8 +8,6 @@ import json
 import os
 import random
 import re
-import shutil
-import tempfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,8 +25,6 @@ IPSW_API = "https://api.ipsw.me/v4"
 APPLE_EVENTS = "https://www.apple.com/apple-events/"
 APPLE_RSS = "https://www.apple.com/newsroom/rss-feed.rss"
 TSSCHECKER = os.environ.get("TSSCHECKER_PATH", str(Path.home() / "Library/Application Support/SowensServer/bin/tsschecker"))
-TSS_WORK_ROOT = Path(os.environ.get("GIR_TSS_WORK_ROOT", "/Volumes/4TB/Services/TSSChecker/runtime"))
-TSS_CONCURRENCY = asyncio.Semaphore(2)
 APPLE_STATE = Path(os.environ.get("GIR_COMMUNITY_FILE", "community.json")).with_name("apple-events-state.json")
 
 QUESTIONS = (
@@ -157,7 +153,7 @@ class ServerSuite(commands.Cog):
 
     async def _get_json(self, url: str):
         async with aiohttp.ClientSession(headers={"User-Agent": "GIR/1.0"}) as session:
-            async with session.get(url, timeout=25) as response:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
                 response.raise_for_status(); return await response.json()
 
     async def _get_devices(self):
@@ -207,73 +203,8 @@ class ServerSuite(commands.Cog):
         firmware = next((item for item in data.get("firmwares", []) if item.get("version") == version), None)
         if not firmware:
             return device, version, "incompatible", "That iOS version was not released for this device."
-        result = None
-        if Path(TSSCHECKER).is_file():
-            work_dir = None
-            try:
-                TSS_WORK_ROOT.mkdir(parents=True, exist_ok=True)
-                work_dir = Path(tempfile.mkdtemp(prefix="request-", dir=TSS_WORK_ROOT))
-                environment = os.environ.copy()
-                environment.update({"TMPDIR": str(work_dir), "HOME": str(work_dir), "XDG_CACHE_HOME": str(work_dir / "cache")})
-                async with TSS_CONCURRENCY:
-                    process = await asyncio.create_subprocess_exec(
-                        TSSCHECKER, "-d", device["identifier"], "-i", version, "-b",
-                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-                        cwd=work_dir, env=environment,
-                    )
-                    try:
-                        output, _ = await asyncio.wait_for(process.communicate(), timeout=45)
-                    except asyncio.TimeoutError:
-                        process.kill(); await process.communicate(); raise
-                text = output.decode(errors="replace")
-                if "IS being signed" in text: result = True
-                elif "IS NOT being signed" in text: result = False
-            except (OSError, asyncio.TimeoutError):
-                logger.exception("TSSChecker signing request failed")
-            finally:
-                if work_dir: shutil.rmtree(work_dir, ignore_errors=True)
-        catalog_signed = bool(firmware.get("signed"))
-        if result is not None and result != catalog_signed:
-            return device, version, "uncertain", "TSSChecker and the firmware catalog disagree. Try again later before restoring."
-        signed = catalog_signed if result is None else result
-        return device, version, "signed" if signed else "unsigned", "Checked with TSSChecker and Apple's signing data."
-
-    async def _resolve_signing(self, question: str):
-        version_match = re.search(r"(?:ios\s*)?(\d+(?:\.\d+){1,2})", question, re.I)
-        device_text = re.split(r"\bfor\b", question, flags=re.I)[-1].strip(" ?.!")
-        device_text = re.sub(r"\b(is|signed|signing|ios|ipados)\b|\d+(?:\.\d+){1,2}", " ", device_text, flags=re.I).strip()
-        if not version_match or not device_text:
-            raise ValueError("Ask like: Is iOS 17.1 signed for iPhone 16?")
-        return await self._check_signing(device_text, version_match.group(1))
-
-    async def _current_signing_summary(self):
-        """Return a useful live result when /tss check has no question."""
-        devices = await self._get_json(IPSW_API + "/devices")
-        preferred_names = ("iPhone 16", "iPhone 16 Pro", "iPhone 15", "iPad Pro 11-inch (M4)")
-        by_name = {str(item.get("name", "")).lower(): item for item in devices}
-        selected = [by_name[name.lower()] for name in preferred_names if name.lower() in by_name]
-        if not selected:
-            selected = [item for item in devices if str(item.get("name", "")).startswith("iPhone")][-4:]
-
-        async def signed_versions(device):
-            data = await self._get_json(f"{IPSW_API}/device/{device['identifier']}?type=ipsw")
-            versions = list(dict.fromkeys(
-                item.get("version") for item in data.get("firmwares", [])
-                if item.get("signed") and item.get("version")
-            ))
-            return device, versions
-
-        results = await asyncio.gather(*(signed_versions(device) for device in selected))
-        lines = [
-            f"**{device['name']}** (`{device['identifier']}`): " + (", ".join(versions[:8]) or "None reported")
-            for device, versions in results
-        ]
-        return discord.Embed(
-            title="Currently signed Apple firmware",
-            description="\n".join(lines),
-            color=discord.Color.green(),
-            timestamp=datetime.now(timezone.utc),
-        ).set_footer(text="Live result from Apple's firmware signing catalog via IPSW.me")
+        signed = bool(firmware.get("signed"))
+        return device, version, "signed" if signed else "unsigned", "Checked against the live Apple firmware signing catalog."
 
     @tss.command(name="check", description="Check whether an iOS version is signed for a device")
     @app_commands.describe(
@@ -283,7 +214,13 @@ class ServerSuite(commands.Cog):
     async def tss_check(self, interaction: discord.Interaction, device: str, ios_version: str):
         await interaction.response.defer()
         try:
-            device, version, status_code, note = await self._check_signing(device, ios_version)
+            device, version, status_code, note = await asyncio.wait_for(
+                self._check_signing(device, ios_version), timeout=25
+            )
+        except asyncio.TimeoutError:
+            await interaction.followup.send(
+                "The signing catalog did not answer within 25 seconds. Please try again.", ephemeral=True
+            ); return
         except (ValueError, aiohttp.ClientError) as error:
             await interaction.followup.send(str(error), ephemeral=True); return
         status, color = {
@@ -356,8 +293,9 @@ class ServerSuite(commands.Cog):
     async def tss_status(self, interaction: discord.Interaction):
         installed = Path(TSSCHECKER).is_file()
         await interaction.response.send_message(
-            f"**TSS Checker:** {'Ready' if installed else 'Catalog fallback only'}\n"
-            "Checks use temporary external-drive storage and clean it after every request. No IPSW is downloaded.",
+            "**Fast signing checks:** Ready\n"
+            "Interactive checks use the live firmware catalog and have a 25-second deadline. No IPSW is downloaded.\n"
+            f"**Local TSSChecker utility:** {'Installed (not used for interactive checks)' if installed else 'Not installed'}",
             ephemeral=True,
         )
 
