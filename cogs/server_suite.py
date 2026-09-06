@@ -47,6 +47,7 @@ class ServerSuite(commands.Cog):
     modtools = app_commands.Group(name="modtools", description="Extra tools for moderators", guild_ids=[cfg.guild_id],
                                   default_permissions=discord.Permissions(manage_messages=True))
     apple = app_commands.Group(name="apple", description="Apple events and firmware signing", guild_ids=[cfg.guild_id])
+    tss = app_commands.Group(name="tss", description="Check Apple firmware signing and device support", guild_ids=[cfg.guild_id])
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -159,22 +160,26 @@ class ServerSuite(commands.Cog):
             async with session.get(url, timeout=25) as response:
                 response.raise_for_status(); return await response.json()
 
-    async def _resolve_signing(self, question: str):
-        version_match = re.search(r"(?:ios\s*)?(\d+(?:\.\d+){1,2})", question, re.I)
-        device_text = re.split(r"\bfor\b", question, flags=re.I)[-1].strip(" ?.!")
-        device_text = re.sub(r"\b(is|signed|signing|ios|ipados)\b|\d+(?:\.\d+){1,2}", " ", device_text, flags=re.I).strip()
-        if not version_match or not device_text:
-            raise ValueError("Ask like: Is iOS 17.1 signed for iPhone 16?")
+    async def _find_device(self, device_text: str):
         devices = await self._get_json(IPSW_API + "/devices")
         names = {str(item["name"]).lower(): item for item in devices}
         identifiers = {str(item["identifier"]).lower(): item for item in devices}
-        needle = device_text.lower()
+        needle = device_text.strip().lower()
         device = names.get(needle) or identifiers.get(needle)
         if not device:
             match = difflib.get_close_matches(needle, list(names) + list(identifiers), n=1, cutoff=.58)
             device = (names.get(match[0]) or identifiers.get(match[0])) if match else None
         if not device:
             raise ValueError(f"I could not match “{device_text}” to an Apple device.")
+        return device
+
+    async def _resolve_signing(self, question: str):
+        version_match = re.search(r"(?:ios\s*)?(\d+(?:\.\d+){1,2})", question, re.I)
+        device_text = re.split(r"\bfor\b", question, flags=re.I)[-1].strip(" ?.!")
+        device_text = re.sub(r"\b(is|signed|signing|ios|ipados)\b|\d+(?:\.\d+){1,2}", " ", device_text, flags=re.I).strip()
+        if not version_match or not device_text:
+            raise ValueError("Ask like: Is iOS 17.1 signed for iPhone 16?")
+        device = await self._find_device(device_text)
         version = version_match.group(1)
         data = await self._get_json(f"{IPSW_API}/device/{device['identifier']}?type=ipsw")
         firmware = next((item for item in data.get("firmwares", []) if item.get("version") == version), None)
@@ -214,9 +219,8 @@ class ServerSuite(commands.Cog):
         signed = catalog_signed if result is None else result
         return device, version, "signed" if signed else "unsigned", "Checked with TSSChecker and Apple's signing data."
 
-    @app_commands.guilds(cfg.guild_id)
-    @app_commands.command(name="signed", description="Ask naturally whether an iOS version is signed for a device")
-    async def signed(self, interaction: discord.Interaction, question: str):
+    @tss.command(name="check", description="Ask naturally whether an iOS version is signed for a device")
+    async def tss_check(self, interaction: discord.Interaction, question: str):
         await interaction.response.defer()
         try:
             device, version, status_code, note = await self._resolve_signing(question)
@@ -231,6 +235,48 @@ class ServerSuite(commands.Cog):
                               timestamp=datetime.now(timezone.utc))
         embed.add_field(name="Device identifier", value=device["identifier"])
         await interaction.followup.send(embed=embed)
+
+    @tss.command(name="device", description="Find the identifier GIR uses for an Apple device")
+    async def tss_device(self, interaction: discord.Interaction, device: str):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            match = await self._find_device(device)
+            await interaction.followup.send(f"**{match['name']}** uses identifier `{match['identifier']}`.", ephemeral=True)
+        except (ValueError, aiohttp.ClientError) as error:
+            await interaction.followup.send(str(error), ephemeral=True)
+
+    @tss.command(name="versions", description="List currently signed iOS versions for a device")
+    async def tss_versions(self, interaction: discord.Interaction, device: str):
+        await interaction.response.defer()
+        try:
+            match = await self._find_device(device)
+            data = await self._get_json(f"{IPSW_API}/device/{match['identifier']}?type=ipsw")
+            signed = [item.get("version") for item in data.get("firmwares", []) if item.get("signed")]
+            versions = list(dict.fromkeys(value for value in signed if value))
+            text = ", ".join(versions[:20]) or "No signed iOS versions were reported."
+            await interaction.followup.send(f"**TSS signing for {match['name']}**\n{text}")
+        except (ValueError, aiohttp.ClientError) as error:
+            await interaction.followup.send(str(error), ephemeral=True)
+
+    @tss.command(name="status", description="Check whether GIR's signing checker is ready")
+    async def tss_status(self, interaction: discord.Interaction):
+        installed = Path(TSSCHECKER).is_file()
+        await interaction.response.send_message(
+            f"**TSS Checker:** {'Ready' if installed else 'Catalog fallback only'}\n"
+            "Checks use temporary external-drive storage and clean it after every request. No IPSW is downloaded.",
+            ephemeral=True,
+        )
+
+    @tss.command(name="help", description="Show examples of every TSS command")
+    async def tss_help(self, interaction: discord.Interaction):
+        await interaction.response.send_message(
+            "**TSS commands**\n"
+            "`/tss check question:Is iOS 17.1 signed for iPhone 16?`\n"
+            "`/tss device device:iPhone 16`\n"
+            "`/tss versions device:iPhone 16`\n"
+            "`/tss status`",
+            ephemeral=True,
+        )
 
     @apple.command(name="events", description="Open Apple's official event page")
     async def apple_events(self, interaction: discord.Interaction):
