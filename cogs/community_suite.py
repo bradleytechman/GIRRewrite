@@ -279,6 +279,12 @@ class CommunitySuite(commands.Cog):
                 for account in settings.get("twitterAccounts") or []:
                     feed_jobs.append(self._fetch_game_feed(session, f"X @{account}", f"{bridge}/twitter/user/{quote(str(account).lstrip('@'))}"))
             feed_results = await asyncio.gather(*feed_jobs)
+            failed_x = [name.removeprefix("X @") for name, payload in feed_results if name.startswith("X @") and isinstance(payload, Exception)]
+            if failed_x:
+                fallback_jobs = [self._fetch_game_feed(session, f"X @{account} via news RSS",
+                    "https://news.google.com/rss/search?q=" + quote(f"site:x.com/{account} (free OR giveaway OR sale OR deal)") + "&hl=en-US&gl=US&ceid=US:en")
+                    for account in failed_x]
+                feed_results.extend(await asyncio.gather(*fallback_jobs))
         games = []
         for name, payload in results:
             if isinstance(payload, Exception):
@@ -475,10 +481,13 @@ class CommunitySuite(commands.Cog):
             embed.set_image(url=game.get("image") or game.get("thumbnail"))
         source = str(game.get("source") or "Giveaway source")
         worth = str(game.get("worth") or "").strip()
+        sale_price = game.get("salePrice")
         users = int(game.get("users") or 0)
         footer = f"via {source}"
         if worth and worth.lower() != "unknown":
             footer += f" · Usually {worth}"
+        if sale_price is not None and float(sale_price or 0) > 0:
+            footer += f" · Now ${float(sale_price):.2f}"
         if users:
             footer += f" · {users:,} claimed"
         embed.set_footer(text=footer[:2048])
