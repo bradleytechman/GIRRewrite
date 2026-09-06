@@ -3,6 +3,7 @@ import os
 import traceback
 import json
 import uuid
+import tempfile
 from pathlib import Path
 import discord
 from discord.ext import commands
@@ -32,6 +33,35 @@ intents.typing = False
 mentions = discord.AllowedMentions(everyone=False, users=True, roles=False)
 
 
+def command_settings_path() -> Path:
+    return Path(os.environ.get(
+        "GIR_COMMUNITY_FILE",
+        str(Path.home() / "Library/Application Support/SowensServer/GIRRuntime/dashboard/data/community.json"),
+    ))
+
+
+def command_selection() -> set[str]:
+    try:
+        return set(json.loads(command_settings_path().read_text()).get("disabledCommands", []))
+    except (OSError, ValueError, TypeError):
+        return set()
+
+
+def save_command_catalog(rows: list[dict]) -> None:
+    path = command_settings_path().with_name("command-catalog.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(prefix="command-catalog.", dir=path.parent)
+    try:
+        with os.fdopen(handle, "w") as stream:
+            json.dump({"commands": rows}, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 class Bot(commands.Bot):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -51,11 +81,27 @@ class Bot(commands.Bot):
 
         setup_context_commands(self)
 
+        guild = discord.Object(id=cfg.guild_id)
+        available = self.tree.get_commands(guild=guild)
+        save_command_catalog([
+            {
+                "name": command.name,
+                "description": getattr(command, "description", None) or "Right-click menu command",
+                "type": int(command.type.value),
+                "default_member_permissions": str(getattr(getattr(command, "default_permissions", None), "value", 0) or 0),
+            }
+            for command in available
+        ])
+        disabled = command_selection()
+        for command in available:
+            if command.name in disabled:
+                self.tree.remove_command(command.name, guild=guild, type=command.type)
+
         # Keep slash commands current without requiring the owner to run !sync
         # after an update. GIR's commands are guild-scoped, so this takes effect
         # immediately in the configured server.
         if os.environ.get("GIR_SYNC_COMMANDS", "True") == "True":
-            synced = await self.tree.sync(guild=discord.Object(id=cfg.guild_id))
+            synced = await self.tree.sync(guild=guild)
             logger.info(f"Synced {len(synced)} application commands.")
 
         self.tasks = Tasks(self)
@@ -74,11 +120,7 @@ class MyTree(app_commands.CommandTree):
 
         if command is not None:
             root_name = command.root_parent.name if command.root_parent else command.name
-            settings_path = Path(os.environ.get("GIR_COMMUNITY_FILE", str(Path.home() / "Library/Application Support/SowensServer/GIRRuntime/dashboard/data/community.json")))
-            try:
-                disabled = set(json.loads(settings_path.read_text()).get("disabledCommands", []))
-            except (OSError, ValueError, TypeError):
-                disabled = set()
+            disabled = command_selection()
             if root_name in disabled and interaction.user.id != cfg.owner_id:
                 await interaction.response.send_message("That command is currently turned off for this server.", ephemeral=True)
                 return False
