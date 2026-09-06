@@ -6,6 +6,7 @@ from pathlib import Path
 # utility, logging, XP, and self-service features that make sense in any Discord
 # server. The original jailbreak/news integrations remain available explicitly.
 default_extensions = [
+    "cogs.community_suite",
     "cogs.commands.info.stats",
     "cogs.commands.info.help",
     "cogs.commands.info.tags",
