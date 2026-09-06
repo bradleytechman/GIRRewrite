@@ -6,6 +6,7 @@ actions start disabled, and every automatic action can be reviewed in Discord.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import random
