@@ -83,11 +83,12 @@ class Bot(commands.Bot):
 
         guild = discord.Object(id=cfg.guild_id)
         available = self.tree.get_commands(guild=guild)
+        command_type = lambda command: getattr(command, "type", discord.AppCommandType.chat_input)
         save_command_catalog([
             {
                 "name": command.name,
                 "description": getattr(command, "description", None) or "Right-click menu command",
-                "type": int(command.type.value),
+                "type": int(command_type(command).value),
                 "default_member_permissions": str(getattr(getattr(command, "default_permissions", None), "value", 0) or 0),
             }
             for command in available
@@ -95,7 +96,7 @@ class Bot(commands.Bot):
         disabled = command_selection()
         for command in available:
             if command.name in disabled:
-                self.tree.remove_command(command.name, guild=guild, type=command.type)
+                self.tree.remove_command(command.name, guild=guild, type=command_type(command))
 
         # Keep slash commands current without requiring the owner to run !sync
         # after an update. GIR's commands are guild-scoped, so this takes effect
