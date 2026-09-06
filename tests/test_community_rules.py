@@ -1,6 +1,19 @@
 import unittest
 
-from community_rules import caps_percent, has_invite, is_image_attachment, recent_count
+from community_rules import caps_percent, detect_scam, has_invite, is_image_attachment, recent_count
+
+
+def test_detects_fake_mrbeast_giveaway():
+    assert detect_scam("MrBeast giveaway winner! Claim now at https://mrbeast-gift.example") == "possible fake MrBeast giveaway"
+
+
+def test_detects_wallet_secret_theft():
+    assert detect_scam("Verify your wallet seed phrase now at https://bit.ly/example") == "possible credential or wallet theft"
+
+
+def test_does_not_flag_normal_scam_discussion():
+    assert detect_scam("I saw a video explaining the MrBeast scam yesterday") is None
+    assert detect_scam("Steam has a giveaway on its official store") is None
 
 
 class CommunityRuleTests(unittest.TestCase):

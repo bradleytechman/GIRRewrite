@@ -25,7 +25,7 @@ from discord.ext import commands, tasks
 
 from utils import cfg, logger
 from utils.framework.permissions import gatekeeper
-from community_rules import caps_percent, has_invite, is_image_attachment, recent_count
+from community_rules import caps_percent, detect_scam, has_invite, is_image_attachment, recent_count
 
 
 DATA_FILE = Path(os.environ.get(
@@ -46,6 +46,7 @@ DEFAULTS = {
         "imageWindowSeconds": 20, "fastSpam": True, "messageThreshold": 7,
         "messageWindowSeconds": 8, "capsSpam": True, "capsPercent": 80,
         "mentionSpam": True, "mentionThreshold": 6, "inviteLinks": False,
+        "scamDetection": True, "scamTimeoutHours": 168,
         "monitorAllChannels": True, "monitoredChannelIDs": [], "ignoredChannelIDs": [], "ignoredRoleIDs": [],
     },
     "welcome": {"enabled": False, "channelID": 0, "message": "Welcome {mention} to {server}!", "goodbyeEnabled": False, "goodbyeMessage": "{name} left the server."},
@@ -482,6 +483,14 @@ class CommunitySuite(commands.Cog):
             "jumpURL": message.jump_url, "attachments": [item.url for item in message.attachments]})
         settings = self.settings()
         lowered = message.content.lower().strip()
+
+        attachment_text = " ".join(f"{item.filename} {getattr(item, 'description', '') or ''}" for item in message.attachments)
+        scam_reason = detect_scam(f"{message.content} {attachment_text}")
+        if settings["automod"].get("scamDetection", True) and scam_reason and not gatekeeper.has(message.guild, message.author, 1):
+            scam_rule = dict(settings["automod"])
+            scam_rule.update({"deleteMessage": True, "timeoutHours": int(scam_rule.get("scamTimeoutHours", 168))})
+            await self._moderate(message, scam_rule, scam_reason)
+            return
 
         # Prevent image dumps from accounts that have not reached Member+.
         # This focused safety rule stays active when general AutoMod is off.

@@ -1,9 +1,17 @@
 """Pure detection helpers for the community suite."""
 import re
+from typing import Optional
 
 
 INVITE_PATTERN = re.compile(r"(?:discord\.gg|discord(?:app)?\.com/invite)/[A-Za-z0-9-]+", re.I)
 IMAGE_EXTENSIONS = {".avif", ".gif", ".heic", ".heif", ".jpeg", ".jpg", ".png", ".webp"}
+URL_PATTERN = re.compile(r"(?:https?://|www\.)\S+", re.I)
+SCAM_BRANDS = re.compile(r"\b(mr\s*beast|discord|steam|paypal|cash\s*app|coinbase|apple|microsoft|xbox|playstation)\b", re.I)
+SCAM_REWARDS = re.compile(r"\b(giveaway|winner|won|free\s+(?:nitro|gift|money|crypto)|airdrop|bonus|reward|claim|double\s+(?:your|my)|investment)\b", re.I)
+SCAM_ACTIONS = re.compile(r"\b(click|verify|connect|scan|deposit|send|withdraw|activate|sign\s*in|login|dm\s+me|message\s+me)\b", re.I)
+SCAM_URGENCY = re.compile(r"\b(now|today only|limited time|act fast|expires?|within\s+\d+\s*(?:minutes?|hours?))\b", re.I)
+SCAM_SECRETS = re.compile(r"\b(seed phrase|recovery phrase|private key|wallet phrase|password|qr code)\b", re.I)
+SUSPICIOUS_HOST = re.compile(r"(?:xn--|bit\.ly|tinyurl\.com|t\.co|discord(?:-|\.)?gift|disc[o0]rd|ste[a4]m|mrbeast)[^\s/]*", re.I)
 
 
 def caps_percent(text: str) -> int:
@@ -24,3 +32,30 @@ def is_image_attachment(content_type, filename: str) -> bool:
     if content_type and content_type.casefold().startswith("image/"):
         return True
     return any(filename.casefold().endswith(extension) for extension in IMAGE_EXTENSIONS)
+
+
+def detect_scam(text: str) -> Optional[str]:
+    """Return a plain-language reason when several independent scam signals agree."""
+    normalized = " ".join(str(text or "").split())
+    if not normalized:
+        return None
+    has_url = bool(URL_PATTERN.search(normalized))
+    brand = SCAM_BRANDS.search(normalized)
+    reward = SCAM_REWARDS.search(normalized)
+    action = SCAM_ACTIONS.search(normalized)
+    urgency = SCAM_URGENCY.search(normalized)
+    secret = SCAM_SECRETS.search(normalized)
+    suspicious_host = SUSPICIOUS_HOST.search(normalized) if has_url else None
+    score = sum((bool(brand), bool(reward), bool(action), bool(urgency), bool(secret) * 2,
+                 bool(suspicious_host) * 2, has_url))
+    # Requiring multiple independent signals prevents ordinary discussion such as
+    # "I saw a MrBeast scam" from being moderated.
+    if score < 4 or not (has_url or secret):
+        return None
+    if brand and re.search(r"mr\s*beast", brand.group(), re.I):
+        return "possible fake MrBeast giveaway"
+    if secret:
+        return "possible credential or wallet theft"
+    if reward:
+        return "possible fake giveaway or reward"
+    return "possible phishing link"
