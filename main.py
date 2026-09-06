@@ -2,6 +2,7 @@ import asyncio
 import os
 import traceback
 import json
+import uuid
 from pathlib import Path
 import discord
 from discord.ext import commands
@@ -130,7 +131,17 @@ async def app_command_error(interaction: discord.Interaction, error: AppCommandE
         error = error.original
 
     if isinstance(error, discord.errors.NotFound):
-        await ctx.channel.send(embed=discord.Embed(color=discord.Color.red(), title=":(\nYour command ran into a problem.", description=f"Sorry {interaction.user.mention}, it looks like I took too long to respond to you! If I didn't do what you wanted in time, please try again."), delete_after=7)
+        try:
+            await ctx.send_error("Discord says this command took too long. Please try it once more.", whisper=True)
+        except discord.HTTPException:
+            pass
+        return
+
+    if isinstance(error, discord.Forbidden):
+        logger.error(f"Discord denied command {getattr(interaction.command, 'qualified_name', 'unknown')}: {error}")
+        await ctx.send_error(
+            "Discord blocked that action. GIR has its moderation permission, but its role may be below the selected member's role. Ask the server owner to move GIR higher in Server Settings → Roles.",
+            followup=True, whisper=True)
         return
 
     if (isinstance(error, commands.MissingRequiredArgument)
@@ -144,19 +155,14 @@ async def app_command_error(interaction: discord.Interaction, error: AppCommandE
             or isinstance(error, commands.NoPrivateMessage)):
         await ctx.send_error(error, followup=True, whisper=True, delete_after=5)
     else:
+        reference = uuid.uuid4().hex[:8]
+        logger.error(f"Command error reference {reference}\n{''.join(traceback.format_exception(type(error), error, error.__traceback__))}")
         try:
-            raise error
-        except:
-            tb = traceback.format_exc()
-            logger.error(tb)
-            if len(tb.split('\n')) > 8:
-                tb = '\n'.join(tb.split('\n')[-8:])
-
-            tb_formatted = tb
-            if len(tb_formatted) > 1000:
-                tb_formatted = "...\n" + tb_formatted[-1000:]
-
-            await ctx.send_error(description=f"`{error}`\n```{tb_formatted}```", followup=True, whisper=True, delete_after=5)
+            await ctx.send_error(
+                description=f"Something unexpected happened. The private server log has reference `{reference}`.",
+                followup=True, whisper=True)
+        except discord.HTTPException:
+            logger.error(f"Could not deliver command error reference {reference} to Discord")
 
 
 @bot.event
