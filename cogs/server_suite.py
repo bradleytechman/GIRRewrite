@@ -188,6 +188,9 @@ class ServerSuite(commands.Cog):
         needle = self._normalise_device_name(device_text)
         device = names.get(needle) or identifiers.get(raw)
         if not device:
+            prefix_matches = [item for name, item in names.items() if name.startswith(needle + " ")]
+            device = prefix_matches[0] if prefix_matches else None
+        if not device:
             match = difflib.get_close_matches(needle, list(names) + list(identifiers), n=1, cutoff=.58)
             device = (names.get(match[0]) or identifiers.get(match[0])) if match else None
         if not device:
