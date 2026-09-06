@@ -111,6 +111,7 @@ class CommunitySuite(commands.Cog):
         self.free_game_check.cancel()
         self.free_game_request_check.cancel()
         self.relay_worker.cancel()
+        self.bot.tree.remove_command("Report message", guild=discord.Object(id=cfg.guild_id), type=discord.AppCommandType.message)
 
     def settings(self):
         return load_settings()
@@ -807,8 +808,6 @@ class CommunitySuite(commands.Cog):
         content, mentions = self._report_mentions(interaction.guild)
         await channel.send(content=content, embed=embed, allowed_mentions=mentions); await interaction.response.send_message("Your report was sent privately to the moderators.", ephemeral=True)
 
-    @app_commands.guilds(cfg.guild_id)
-    @app_commands.context_menu(name="Report message")
     async def report_message(self, interaction: discord.Interaction, message: discord.Message):
         if not self._report_access(interaction.user):
             await interaction.response.send_message("You are not in a role allowed to report messages.", ephemeral=True); return
@@ -1082,4 +1081,7 @@ class CommunitySuite(commands.Cog):
 
 
 async def setup(bot):
-    await bot.add_cog(CommunitySuite(bot))
+    cog = CommunitySuite(bot)
+    await bot.add_cog(cog)
+    bot.tree.add_command(app_commands.ContextMenu(name="Report message", callback=cog.report_message),
+                         guild=discord.Object(id=cfg.guild_id))
