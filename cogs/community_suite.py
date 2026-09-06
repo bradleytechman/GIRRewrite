@@ -36,7 +36,7 @@ GAME_STATUS_FILE = DATA_FILE.with_name("free-games-status.json")
 GAME_REQUEST_FILE = DATA_FILE.with_name("free-games-request.json")
 GAME_API = "https://www.gamerpower.com/api/giveaways"
 EPIC_API = "https://store-site-backend-static.ak.epicgames.com/freeGamesPromotions?locale=en-US&country=US&allowCountries=US"
-CHEAPSHARK_API = "https://www.cheapshark.com/api/1.0/deals?upperPrice=0&onSale=1&pageSize=60&sortBy=Recent"
+CHEAPSHARK_API = "https://www.cheapshark.com/api/1.0/deals?onSale=1&pageSize=60&sortBy=Savings"
 DEFAULT_GAME_FEEDS = [
     "https://www.reddit.com/r/FreeGameFindings+FreeGamesOnSteam+GameDeals/.rss?limit=75",
     "https://www.gamerpower.com/rss/pc",
@@ -55,7 +55,7 @@ DEFAULTS = {
     "autorole": {"enabled": False, "roleIDs": []},
     "starboard": {"enabled": False, "channelID": 0, "threshold": 3, "emoji": "⭐"},
     "suggestions": {"enabled": False, "channelID": 0},
-    "freeGames": {"enabled": False, "channelID": 0, "platforms": ["pc", "steam", "epic-games-store", "ps4", "ps5", "xbox-one", "xbox-series-xs"], "types": ["game"], "sources": ["gamerpower", "epic", "cheapshark", "communityFeeds"], "communityFeedURLs": DEFAULT_GAME_FEEDS, "twitterAccounts": ["EpicGames", "GamerPowercom", "FreeGameFinding", "just_free_games"], "twitterBridge": "https://rsshub.app", "checkMinutes": 15, "pingRoleID": 0, "minimumWorth": 0, "hideUnrated": False, "includeExpired": False, "maxPostsPerCheck": 5},
+    "freeGames": {"enabled": False, "channelID": 0, "platforms": ["pc", "steam", "epic-games-store", "ps4", "ps5", "xbox-one", "xbox-series-xs"], "types": ["game"], "sources": ["gamerpower", "epic", "cheapshark", "communityFeeds"], "communityFeedURLs": DEFAULT_GAME_FEEDS, "twitterAccounts": ["EpicGames", "GamerPowercom", "FreeGameFinding", "just_free_games", "CDKeys_com", "G2A_com"], "twitterBridge": "https://rsshub.app", "offerMode": "both", "minimumDiscountPercent": 50, "checkMinutes": 15, "pingRoleID": 0, "minimumWorth": 0, "hideUnrated": False, "includeExpired": False, "maxPostsPerCheck": 5},
     "movieNight": {"enabled": False, "channelID": 0, "pingRoleID": 0},
     "relay": {"enabled": False, "destinationGuildID": 0, "messages": True, "edits": True,
               "deletes": True, "reactions": True, "channelRoutes": []},
@@ -186,7 +186,7 @@ class CommunitySuite(commands.Cog):
                 searchable = (title + " " + detail).lower()
                 category = node.find("{*}category")
                 subreddit = str(category.get("term", "")) if category is not None else ""
-                if (subreddit.lower() == "gamedeals" or name == "Reddit GameDeals" or name.startswith("X @")) and not re.search(r"\b(free|100% off|0\.00|giveaway)\b", searchable):
+                if (subreddit.lower() == "gamedeals" or name == "Reddit GameDeals" or name.startswith("X @")) and not re.search(r"\b(free|giveaway|sale|deal|discount|save)\b|\d+% off|\$0\.00", searchable):
                     continue
                 link = value("link", "{*}link")
                 identifier = value("guid", "{*}id") or link or title
@@ -194,8 +194,11 @@ class CommunitySuite(commands.Cog):
                             else "PlayStation 5, PlayStation 4" if re.search(r"\b(ps5|ps4|playstation)\b", searchable)
                             else "Xbox Series X/S, Xbox One" if "xbox" in searchable else "Nintendo Switch" if "switch" in searchable else "PC")
                 offer_type = "loot" if re.search(r"\b(dlc|pack|loot|skin|key)\b", searchable) else "game"
+                percent = re.search(r"(\d{1,3})%\s*off", searchable)
                 games.append({"id": f"feed:{hashlib.sha256(identifier.encode()).hexdigest()}", "title": title,
                     "description": detail[:900], "platforms": platform, "type": offer_type, "worth": "Unknown",
+                    "salePrice": 0 if re.search(r"\b(free|giveaway)\b|\$0\.00|100% off", searchable) else None,
+                    "discountPercent": int(percent.group(1)) if percent else 0,
                     "end_date": None, "open_giveaway_url": link, "source": f"Reddit r/{subreddit}" if subreddit else name, "source_url": url})
             return name, games
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, ET.ParseError) as error:
@@ -225,12 +228,13 @@ class CommunitySuite(commands.Cog):
 
     @staticmethod
     def _cheapshark_games(rows):
-        return [{"id": f"cheapshark:{row.get('dealID')}", "title": row.get("title"), "description": "A store deal currently listed at no cost.",
+        return [{"id": f"cheapshark:{row.get('dealID')}", "title": row.get("title"), "description": f"Discounted from ${float(row.get('normalPrice') or 0):.2f} to ${float(row.get('salePrice') or 0):.2f}.",
                  "platforms": "PC", "type": "game", "worth": f"${float(row.get('normalPrice') or 0):.2f}",
+                 "salePrice": float(row.get("salePrice") or 0), "discountPercent": float(row.get("savings") or 0),
                  "end_date": None, "thumbnail": row.get("thumb"),
                  "open_giveaway_url": f"https://www.cheapshark.com/redirect?dealID={quote(str(row.get('dealID') or ''), safe='')}",
                  "source": "CheapShark", "source_url": "https://www.cheapshark.com/"}
-                for row in rows if float(row.get("salePrice") or 1) == 0]
+                for row in rows]
 
     @staticmethod
     def _dedupe_games(games):
@@ -298,6 +302,7 @@ class CommunitySuite(commands.Cog):
         types = {str(value).lower() for value in settings.get("types", [])}
         minimum_worth = max(0.0, float(settings.get("minimumWorth", 0) or 0))
         now = datetime.now(timezone.utc)
+        offer_mode = str(settings.get("offerMode", "both")); minimum_discount = float(settings.get("minimumDiscountPercent", 50) or 0)
 
         def worth(game):
             match = re.search(r"\d+(?:\.\d+)?", str(game.get("worth") or "0").replace(",", ""))
@@ -308,6 +313,13 @@ class CommunitySuite(commands.Cog):
                 return True
             end = self._game_date(game["end_date"])
             return end is None or end > now
+
+        def offer_matches(game):
+            source = str(game.get("source", "")).lower()
+            text = " ".join(str(game.get(key, "")) for key in ("title", "description")).lower()
+            free = game.get("salePrice") == 0 or source in {"gamerpower", "epic games store", "gamerpower rss"} or "freegamefindings" in source or "freegamesonsteam" in source or bool(re.search(r"\b(free|giveaway)\b|\$0\.00|100% off", text))
+            discounted = float(game.get("discountPercent") or 0) >= minimum_discount
+            return free if offer_mode == "free" else discounted and not free if offer_mode == "discounts" else free or discounted
 
         aliases = {"epic-games-store": "epic games store", "ps4": "playstation 4", "ps5": "playstation 5",
                    "xbox-one": "xbox one", "xbox-series-xs": "xbox series x/s", "itchio": "itch.io"}
@@ -321,6 +333,7 @@ class CommunitySuite(commands.Cog):
                 and (not types or str(game.get("type", "")).lower() in types)
                 and worth(game) >= minimum_worth
                 and (not settings.get("hideUnrated") or worth(game) > 0)
+                and offer_matches(game)
                 and active(game)]
 
     @tasks.loop(minutes=15)
@@ -439,6 +452,8 @@ class CommunitySuite(commands.Cog):
 
     @staticmethod
     def _claim_kind(game):
+        if game.get("salePrice") is not None and float(game.get("salePrice") or 0) > 0:
+            return f"{float(game.get('discountPercent') or 0):.0f}% off"
         text = " ".join(str(game.get(key, "")) for key in ("title", "description", "instructions")).lower()
         temporary = ("free weekend", "free week", "free to play until", "play for free", "open beta", "playtest")
         return "Free to play" if any(phrase in text for phrase in temporary) else "Free to keep"
