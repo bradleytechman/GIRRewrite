@@ -292,9 +292,19 @@ class CommunitySuite(commands.Cog):
         minutes = min(1440, max(5, int(settings.get("checkMinutes", 15) or 15)))
         channel = self.bot.get_channel(int(settings.get("channelID") or 0))
         if not channel:
-            preferred = {"free-games", "freebies", "game-deals", "giveaways"}
+            preferred = ("free-games", "freebies", "game-deals", "giveaways")
             guild = self.bot.get_guild(cfg.guild_id)
-            channel = next((item for item in getattr(guild, "text_channels", []) if item.name.lower() in preferred), None)
+            by_name = {item.name.lower(): item for item in getattr(guild, "text_channels", [])}
+            channel = next((by_name[name] for name in preferred if name in by_name), None)
+            if channel:
+                try:
+                    saved = json.loads(DATA_FILE.read_text())
+                    saved.setdefault("freeGames", {})["channelID"] = channel.id
+                    temporary = DATA_FILE.with_suffix(".tmp")
+                    temporary.write_text(json.dumps(saved, indent=2, sort_keys=True) + "\n")
+                    temporary.replace(DATA_FILE)
+                except (OSError, ValueError, TypeError):
+                    logger.exception("Could not persist the recovered free-game channel")
         if not channel:
             logger.warning("Free-game alerts are enabled but no valid alert channel is available")
             return self._save_game_status("failed", message="No valid free-game channel is available")
