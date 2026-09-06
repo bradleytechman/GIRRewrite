@@ -105,7 +105,7 @@ class GuildService:
         await self.get_raid_phrases.cache.clear()
         return True
     
-    @cached(ttl=3600, key="guild_raid_phrases")
+    @cached(ttl=30, key="guild_raid_phrases")
     async def get_raid_phrases(self):
         return self.get_guild().raid_phrases
 
@@ -125,7 +125,7 @@ class GuildService:
         await self.get_filtered_words.cache.clear()
         return True
 
-    @cached(ttl=3600, key="guild_filtered_words")
+    @cached(ttl=30, key="guild_filtered_words")
     async def get_filtered_words(self) -> FilterWord:
         return self.get_guild().filter_words
 
