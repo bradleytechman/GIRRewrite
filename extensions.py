@@ -1,7 +1,6 @@
-import json
+so just import json
 import os
 from pathlib import Path
-
 # The upstream bot was built for r/Jailbreak. Start with the general moderation,
 # utility, logging, XP, and self-service features that make sense in any Discord
 # server. The original jailbreak/news integrations remain available explicitly.
@@ -29,15 +28,16 @@ default_extensions = [
     "cogs.monitors.utils.birthday",
     "cogs.monitors.utils.xp",
 ]
-
+_REPO_ROOT = Path(__file__).resolve().parent
 feature_file = Path(os.environ.get(
-    "GIR_FEATURE_FILE", str(Path.home() / "Library/Application Support/SowensServer/GIRRuntime/dashboard/data/features.json")))
+    "GIR_FEATURE_FILE",
+    str(_REPO_ROOT / "data" / "features.json"),
+))
 try:
     enabled_extensions = set(json.loads(feature_file.read_text()).get("enabled", []))
     initial_extensions = [name for name in default_extensions if name in enabled_extensions]
 except (OSError, ValueError, TypeError):
     initial_extensions = list(default_extensions)
-
 if os.environ.get("GIR_LEGACY_JAILBREAK_FEATURES") == "True":
     initial_extensions += [
         "cogs.commands.info.devices",
@@ -51,3 +51,4 @@ if os.environ.get("GIR_LEGACY_JAILBREAK_FEATURES") == "True":
         "cogs.monitors.utils.applenews",
         "cogs.monitors.utils.jailbreak_monitors",
     ]
+ is fine

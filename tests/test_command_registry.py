@@ -38,8 +38,8 @@ class CommandRegistryTests(unittest.TestCase):
 
     def test_overlapping_commands_are_consolidated(self):
         names = set(slash_command_names())
-        self.assertTrue({"avatar", "serverinfo", "announce", "kick"}.issubset(names))
-        self.assertTrue({"pfp", "membercount", "embed", "roblox"}.isdisjoint(names))
+        self.assertTrue({"avatar", "serverinfo", "announce", "kick", "roblox"}.issubset(names))
+        self.assertTrue({"pfp", "membercount", "embed"}.isdisjoint(names))
 
     def test_registry_stays_below_discord_limit(self):
         self.assertLessEqual(len(slash_command_names()), 100)

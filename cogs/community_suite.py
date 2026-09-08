@@ -32,10 +32,12 @@ from community_rules import (caps_percent, detect_scam, has_hidden_invite, has_i
                              normalize_obfuscated_text, recent_count)
 
 
+_REPO_ROOT = Path(__file__).resolve().parents[1] #cogs, then root)
 DATA_FILE = Path(os.environ.get(
     "GIR_COMMUNITY_FILE",
-    str(Path.home() / "Library/Application Support/SowensServer/GIRRuntime/dashboard/data/community.json"),
+    str(_REPO_ROOT / "data" / "community.json"),
 ))
+
 GAME_STATE_FILE = DATA_FILE.with_name("free-games-state.json")
 GAME_STATUS_FILE = DATA_FILE.with_name("free-games-status.json")
 GAME_REQUEST_FILE = DATA_FILE.with_name("free-games-request.json")
@@ -64,7 +66,7 @@ DEFAULTS = {
                         "storeDisplayNames": True, "storeAvatarHashes": True, "storeRoles": True},
     "welcome": {"enabled": False, "channelID": 0, "message": "Welcome {mention} to {server}!", "goodbyeEnabled": False, "goodbyeMessage": "{name} left the server."},
     "autorole": {"enabled": False, "roleIDs": []},
-    "starboard": {"enabled": False, "channelID": 0, "threshold": 3, "emoji": "⭐"},
+    "starboard": {"enabled": False, "channelID": 0, "threshold": 4, "emoji": "⭐"},
     "suggestions": {"enabled": False, "channelID": 0},
     "freeGames": {"enabled": False, "channelID": 0, "platforms": ["pc", "steam", "epic-games-store", "ps4", "ps5", "xbox-one", "xbox-series-xs"], "types": ["game"], "sources": ["gamerpower", "epic", "cheapshark"], "offerMode": "both", "minimumDiscountPercent": 50, "checkMinutes": 15, "pingRoleID": 0, "minimumWorth": 0, "hideUnrated": False, "includeExpired": False, "maxPostsPerCheck": 5},
     "movieNight": {"enabled": False, "channelID": 0, "pingRoleID": 0},
@@ -841,7 +843,7 @@ class CommunitySuite(commands.Cog):
         except discord.HTTPException:
             return
         reaction = next((r for r in message.reactions if str(r.emoji) == str(payload.emoji)), None)
-        if not reaction or reaction.count < int(star.get("threshold", 3)):
+        if not reaction or reaction.count < int(star.get("threshold", 4)):
             return
         embed = discord.Embed(description=message.content or "Shared attachment", color=discord.Color.gold(), timestamp=message.created_at)
         embed.set_author(name=str(message.author), icon_url=message.author.display_avatar.url)

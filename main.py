@@ -36,9 +36,8 @@ mentions = discord.AllowedMentions(everyone=False, users=True, roles=False)
 def command_settings_path() -> Path:
     return Path(os.environ.get(
         "GIR_COMMUNITY_FILE",
-        str(Path.home() / "Library/Application Support/SowensServer/GIRRuntime/dashboard/data/community.json"),
+        str(Path(__file__).resolve().parent / "data" / "community.json"),
     ))
-
 
 def command_selection() -> set[str]:
     try:

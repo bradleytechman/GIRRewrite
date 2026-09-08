@@ -57,6 +57,26 @@ class ModActions(commands.Cog):
 
         await ctx.respond_or_edit(embed=log, delete_after=10)
         await submit_public_log(ctx, member, log)
+        
+    @mod_and_up()
+    @app_commands.guilds(cfg.guild_id)
+    @app_commands.command(description="Kick a user for confusing this server with Roblox Jailbreak")
+    @app_commands.describe(member="User to kick")
+    @transform_context
+    async def roblox(self, ctx: GIRContext, member: ModsAndAboveMember) -> None:
+        reason = "This Discord server is for iOS jailbreaking, not Roblox. Please join https://discord.gg/jailbreak instead, thank you!"
+
+        db_guild = guild_service.get_guild()
+
+        log = add_kick_case(target_member=member, mod=ctx.author, reason=reason, db_guild=db_guild)
+        await notify_user(member, f"You were kicked from {ctx.guild.name}", log)
+
+        await ctx.defer(ephemeral=False)
+        await member.kick(reason=reason)
+
+        await ctx.respond_or_edit(embed=log, delete_after=10)
+        await submit_public_log(ctx, member, log)
+
 
     @mod_and_up()
     @app_commands.guilds(cfg.guild_id)
@@ -201,6 +221,7 @@ class ModActions(commands.Cog):
         db_guild = guild_service.get_guild()
 
         member_is_external = isinstance(user, discord.User)
+        initiator = ctx.author
 
         # if the ID given is of a user who isn't in the guild, try to fetch the profile
         if member_is_external:
@@ -216,10 +237,17 @@ class ModActions(commands.Cog):
             await ctx.send_warning(f"Cancelled staff banning {user.mention}.")
             return
 
-        self.bot.ban_cache.ban(user.id)
-        log = await add_ban_case(user, ctx.author, reason, db_guild)
+        class StaffMod:
+            id = ctx.guild.id
+            mention = f"{ctx.guild.name} Staff"
 
-        log.set_field_at(1, name="Mod", value=f"{ctx.guild.name} Staff")
+            def __str__(self):
+                return f"{ctx.guild.name} Staff"
+                # we will do this due to the bug of showing whoever pressed yes showing up in /cases
+
+        staff_mod = StaffMod()
+        self.bot.ban_cache.ban(user.id)
+        log = await add_ban_case(user, staff_mod, reason, db_guild)
 
         if not member_is_external:
             if cfg.ban_appeal_url is None:

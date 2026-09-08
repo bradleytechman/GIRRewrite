@@ -10,11 +10,11 @@ INVITE_PATTERN = re.compile(
 )
 IMAGE_EXTENSIONS = {".avif", ".gif", ".heic", ".heif", ".jpeg", ".jpg", ".png", ".webp"}
 URL_PATTERN = re.compile(r"(?:https?://|www\.)\S+", re.I)
-SCAM_BRANDS = re.compile(r"\b(mr\s*beast|discord|steam|paypal|cash\s*app|coinbase|apple|microsoft|xbox|playstation)\b", re.I)
-SCAM_REWARDS = re.compile(r"\b(giveaway|winner|won|free\s+(?:nitro|gift|money|crypto)|airdrop|bonus|reward|claim|double\s+(?:your|my)|investment)\b", re.I)
+SCAM_BRANDS = re.compile(r"\b(mr\s*beast|steam|paypal|cash\s*app|coinbase|microsoft|xbox|playstation)\b", re.I)
+SCAM_REWARDS = re.compile(r"\b(giveaway|winner|won|free\s+(?:nitro|gift|money|crypto)|bonus|reward|claim|double\s+(?:your|my)|investment)\b", re.I)
 SCAM_ACTIONS = re.compile(r"\b(click|verify|connect|scan|deposit|send|withdraw|activate|sign\s*in|login|dm\s+me|message\s+me)\b", re.I)
 SCAM_URGENCY = re.compile(r"\b(now|today only|limited time|act fast|expires?|within\s+\d+\s*(?:minutes?|hours?))\b", re.I)
-SCAM_SECRETS = re.compile(r"\b(seed phrase|recovery phrase|private key|wallet phrase|password|qr code)\b", re.I)
+SCAM_SECRETS = re.compile(r"\b(seed phrase|recovery phrase|private key|wallet phrase)\b", re.I)
 SUSPICIOUS_HOST = re.compile(r"(?:xn--|bit\.ly|tinyurl\.com|t\.co|discord(?:-|\.)?gift|disc[o0]rd|ste[a4]m|mrbeast)[^\s/]*", re.I)
 INVISIBLE_CHARACTERS = re.compile(r"[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\uffa0]")
 
