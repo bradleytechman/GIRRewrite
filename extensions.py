@@ -1,4 +1,4 @@
-so just import json
+import json
 import os
 from pathlib import Path
 # The upstream bot was built for r/Jailbreak. Start with the general moderation,
@@ -51,4 +51,3 @@ if os.environ.get("GIR_LEGACY_JAILBREAK_FEATURES") == "True":
         "cogs.monitors.utils.applenews",
         "cogs.monitors.utils.jailbreak_monitors",
     ]
- is fine
