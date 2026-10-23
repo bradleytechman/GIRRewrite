@@ -11,6 +11,9 @@ from utils.mod.mod_logs import prepare_ban_log, prepare_kick_log
 
 from utils.config import cfg
 
+# Shown everywhere a staff ban's moderator would otherwise appear.
+STAFF_BAN_MOD_TAG = "r/Jailbreak Staff"
+
 
 def add_kick_case(target_member: discord.Member, mod: discord.Member, reason: str, db_guild):
     """Adds kick case to user
@@ -168,7 +171,7 @@ async def submit_public_log(ctx: GIRContext, user: Union[discord.Member, discord
             await public_chan.send(embed=log)
 
 
-async def add_ban_case(target_member: discord.Member, mod: discord.Member, reason, db_guild: Guild = None):
+async def add_ban_case(target_member: discord.Member, mod: discord.Member, reason, db_guild: Guild = None, *, mod_tag: str = None):
     """Adds ban case to user
 
     Parameters
@@ -181,14 +184,17 @@ async def add_ban_case(target_member: discord.Member, mod: discord.Member, reaso
         "Reason member was banned"
     db_guild
         "Guild DB"
+    mod_tag : str
+        "Moderator name to store and display. Defaults to the acting mod."
 
     """
+    displayed_mod = mod_tag or str(mod)
     # prepare the case to store in DB
     case = Case(
         _id=db_guild.case_id,
         _type="BAN",
         mod_id=mod.id,
-        mod_tag=str(mod),
+        mod_tag=displayed_mod,
         punishment="PERMANENT",
         reason=reason,
     )
@@ -198,7 +204,13 @@ async def add_ban_case(target_member: discord.Member, mod: discord.Member, reaso
     # add case to db
     user_service.add_case(target_member.id, case)
     # prepare log embed to send to #public-mod-logs, user and context
-    return prepare_ban_log(mod, target_member, case)
+    log = prepare_ban_log(mod, target_member, case)
+    if mod_tag is not None:
+        for index, field in enumerate(log.fields):
+            if field.name == "Mod":
+                log.set_field_at(index, name="Mod", value=mod_tag, inline=field.inline)
+                break
+    return log
 
 async def delay_delete(ctx: discord.Interaction):
     await asyncio.sleep(10)

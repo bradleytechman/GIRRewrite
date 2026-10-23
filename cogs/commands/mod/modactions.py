@@ -10,7 +10,7 @@ from discord.ext import commands
 from discord.utils import escape_markdown, escape_mentions
 from utils import GIRContext, cfg, transform_context
 from utils.framework import mod_and_up, ModsAndAboveMemberOrUser, Duration, ModsAndAboveMember, UserOnly
-from utils.mod import (add_ban_case, add_kick_case, notify_user,
+from utils.mod import (STAFF_BAN_MOD_TAG, add_ban_case, add_kick_case, notify_user,
                        prepare_editreason_log, prepare_liftwarn_log,
                        prepare_mute_log, prepare_removepoints_log,
                        prepare_unban_log, prepare_unmute_log,
@@ -235,10 +235,16 @@ class ModActions(commands.Cog):
             await ctx.send_warning(f"Cancelled staff banning {user.mention}.")
             return
 
+        # The confirm button replaces ctx.interaction, so ctx.author is the
+        # approver here. Attribute the case to the bot and store the public name.
         self.bot.ban_cache.ban(user.id)
-        log = await add_ban_case(user, ctx.author, reason, db_guild)
-
-        log.set_field_at(1, name="Mod", value=f"{ctx.guild.name} Staff")
+        log = await add_ban_case(
+            user,
+            ctx.me or ctx.bot.user,
+            reason,
+            db_guild,
+            mod_tag=STAFF_BAN_MOD_TAG,
+        )
 
         if not member_is_external:
             if cfg.ban_appeal_url is None:

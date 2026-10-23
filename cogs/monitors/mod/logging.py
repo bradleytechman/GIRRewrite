@@ -3,19 +3,26 @@ import discord
 from discord.ext import commands
 from discord.utils import format_dt
 
+from collections import OrderedDict
 from datetime import datetime, timezone
 from io import BytesIO
-from typing import List, Union
+from typing import List, Optional, Union
 
 import discord
 from data.services.guild_service import guild_service
 from data.services.user_service import user_service
 from utils.config import cfg
 
+# Discord's own cache only keeps the last 1000 messages, so deletes of older
+# messages (and attachment-only messages) were dropped. Keep a larger snapshot.
+MESSAGE_CACHE_LIMIT = 20000
+MAX_LOGGED_ATTACHMENT_BYTES = 8 * 1024 * 1024
+
 
 class Logging(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self._message_cache = OrderedDict()
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member) -> None:
@@ -116,6 +123,41 @@ class Logging(commands.Cog):
             # send message to webhook
             await the_webhook.send(**body, allowed_mentions=discord.AllowedMentions(users=False, everyone=False, roles=False))
 
+    def _remember_message(self, message: discord.Message) -> None:
+        if message is None or message.guild is None or message.guild.id != cfg.guild_id:
+            return
+        if message.author is None or message.author.bot:
+            return
+
+        self._message_cache[message.id] = {
+            "author_id": message.author.id,
+            "author_name": str(message.author),
+            "author_mention": message.author.mention,
+            "author_avatar": str(message.author.display_avatar),
+            "content": message.content or "",
+            "channel_id": message.channel.id,
+            "jump_url": message.jump_url,
+            "created_at": message.created_at,
+            "attachments": [
+                {
+                    "filename": attachment.filename,
+                    "url": attachment.url,
+                    "proxy_url": attachment.proxy_url,
+                    "size": attachment.size,
+                    "spoiler": attachment.is_spoiler(),
+                }
+                for attachment in message.attachments
+            ],
+            "stickers": [sticker.name for sticker in message.stickers],
+        }
+        self._message_cache.move_to_end(message.id)
+        while len(self._message_cache) > MESSAGE_CACHE_LIMIT:
+            self._message_cache.popitem(last=False)
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message) -> None:
+        self._remember_message(message)
+
     @commands.Cog.listener()
     async def on_message_edit(self, before: discord.Message, after: discord.Message) -> None:
         """Log message edits with before and after content
@@ -126,6 +168,8 @@ class Logging(commands.Cog):
         after : discord.Message
             Aftere edit message data
         """
+
+        self._remember_message(after)
 
         if not before.guild:
             return
@@ -162,53 +206,220 @@ class Logging(commands.Cog):
         embed.set_footer(text=before.author.id)
         await channel.send(embed=embed)
 
+    def _deleted_message_text(self, content: str, attachments, stickers, jump_url: Optional[str]) -> str:
+        parts = []
+        text = (content or "").strip()
+        if text:
+            parts.append(text if len(text) <= 500 else text[:500] + "...")
+
+        if attachments:
+            lines = []
+            for attachment in attachments:
+                if isinstance(attachment, dict):
+                    filename = attachment.get("filename") or "attachment"
+                    url = attachment.get("url") or ""
+                else:
+                    filename = attachment.filename
+                    url = attachment.url
+                lines.append(f"[{filename}]({url})" if url else filename)
+            parts.append("**Attachments**\n" + "\n".join(lines))
+
+        if stickers:
+            parts.append("**Stickers**\n" + ", ".join(stickers))
+
+        body = "\n\n".join(parts) if parts else "*No text content*"
+        link = f"\n\n[Link to message]({jump_url})" if jump_url else ""
+        # Embed field values cannot be longer than 1024 characters.
+        limit = 1024 - len(link)
+        if len(body) > limit:
+            body = body[:max(limit - 3, 0)] + "..."
+        return body + link
+
+    async def _files_from_message(self, message: discord.Message) -> List[discord.File]:
+        files = []
+        for attachment in message.attachments:
+            if len(files) >= 10:
+                break
+            if attachment.size and attachment.size > MAX_LOGGED_ATTACHMENT_BYTES:
+                continue
+            saved = None
+            for use_cached in (True, False):
+                try:
+                    saved = await attachment.to_file(use_cached=use_cached, spoiler=attachment.is_spoiler())
+                    break
+                except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+                    continue
+            if saved is not None:
+                files.append(saved)
+        return files
+
+    async def _files_from_snapshots(self, attachments) -> List[discord.File]:
+        files = []
+        if not attachments:
+            return files
+
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for attachment in attachments:
+                if len(files) >= 10:
+                    break
+                size = attachment.get("size") or 0
+                if size > MAX_LOGGED_ATTACHMENT_BYTES:
+                    continue
+                data = None
+                for url in (attachment.get("proxy_url"), attachment.get("url")):
+                    if not url:
+                        continue
+                    try:
+                        async with session.get(url) as response:
+                            if response.status != 200:
+                                continue
+                            data = await response.read()
+                            break
+                    except (aiohttp.ClientError, TimeoutError):
+                        continue
+                if not data or len(data) > MAX_LOGGED_ATTACHMENT_BYTES:
+                    continue
+                filename = attachment.get("filename") or "attachment"
+                files.append(discord.File(
+                    BytesIO(data),
+                    filename=filename,
+                    spoiler=bool(attachment.get("spoiler")),
+                ))
+        return files
+
+    async def _delete_audit_entry(self, guild: discord.Guild, channel_id: int, author_id: Optional[int]):
+        """Return the audit entry for a recent moderator delete in this channel, if any."""
+        try:
+            now = datetime.now(timezone.utc)
+            async for action in guild.audit_logs(limit=6, action=discord.AuditLogAction.message_delete):
+                created = action.created_at
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                if (now - created).total_seconds() > 15:
+                    return None
+                extra_channel = getattr(action.extra, "channel", None)
+                if extra_channel is not None and getattr(extra_channel, "id", None) != channel_id:
+                    continue
+                if author_id is not None and getattr(action.target, "id", None) != author_id:
+                    continue
+                return action
+        except (discord.HTTPException, discord.Forbidden):
+            return None
+        return None
+
+    async def _send_delete_embed(self, channel: discord.TextChannel, embed: discord.Embed, files: List[discord.File]) -> None:
+        try:
+            if files:
+                await channel.send(embed=embed, files=files)
+                return
+        except discord.HTTPException:
+            pass
+        await channel.send(embed=embed)
+
     @commands.Cog.listener()
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
-        """Log message deletes
+        """Log message deletes, including attachment-only and uncached messages.
         Parameters
         ----------
-        message : discord.Message
-            Message that was deleted
+        payload : discord.RawMessageDeleteEvent
+            Delete event. cached_message is only set when Discord.py still has it.
         """
 
-        message = payload.cached_message
+        if payload.guild_id != cfg.guild_id:
+            return
 
-        if not message or not message.guild:
+        message = payload.cached_message
+        snapshot = self._message_cache.pop(payload.message_id, None)
+        if message is not None and message.author.bot:
             return
-        if message.guild.id != cfg.guild_id:
+
+        guild = message.guild if message is not None and message.guild is not None else self.bot.get_guild(payload.guild_id)
+        if guild is None:
             return
-        if message.author.bot:
-            return
-        if message.content == "" or not message.content:
-            return
+
+        if message is not None:
+            channel_id = message.channel.id
+            author_id = message.author.id
+            author_name = str(message.author)
+            author_mention = message.author.mention
+            author_avatar = str(message.author.display_avatar)
+            content = message.content or ""
+            attachments = message.attachments
+            stickers = [sticker.name for sticker in message.stickers]
+            jump_url = message.jump_url
+            channel_value = message.channel.mention
+        elif snapshot is not None:
+            channel_id = snapshot["channel_id"]
+            author_id = snapshot["author_id"]
+            author_name = snapshot["author_name"]
+            author_mention = snapshot["author_mention"]
+            author_avatar = snapshot["author_avatar"]
+            content = snapshot["content"]
+            attachments = snapshot["attachments"]
+            stickers = snapshot["stickers"]
+            jump_url = snapshot["jump_url"]
+            source = guild.get_channel(channel_id)
+            channel_value = source.mention if source is not None else f"<#{channel_id}>"
+        else:
+            channel_id = payload.channel_id
+            author_id = None
+            author_name = None
+            author_mention = None
+            author_avatar = None
+            content = ""
+            attachments = []
+            stickers = []
+            jump_url = None
+            source = guild.get_channel(channel_id)
+            channel_value = source.mention if source is not None else f"<#{channel_id}>"
 
         db_guild = guild_service.get_guild()
-        if message.channel.id in db_guild.logging_excluded_channels:
+        if channel_id in db_guild.logging_excluded_channels:
             return
 
-        channel = message.guild.get_channel(cfg.channels.private_logs)
+        log_channel = guild.get_channel(cfg.channels.private_logs)
+        if log_channel is None:
+            return
+
+        audit_entry = await self._delete_audit_entry(guild, channel_id, author_id)
+        if author_id is None and audit_entry is not None and audit_entry.target is not None:
+            author_id = audit_entry.target.id
+            author_name = str(audit_entry.target)
+            author_mention = audit_entry.target.mention
 
         embed = discord.Embed(title="Message Deleted")
         embed.color = discord.Color.red()
-        embed.set_thumbnail(url=message.author.display_avatar)
-        embed.add_field(
-            name="User", value=f'{message.author} ({message.author.mention})', inline=True)
-        embed.add_field(
-            name="Channel", value=message.channel.mention, inline=True)
-        content = message.content
-        async for action in message.guild.audit_logs(limit=1, action=discord.AuditLogAction.message_delete):
-            if action.target.id == message.author.id:
-                embed.add_field(
-                    name="Deleted by", value=f'{action.user} ({action.user.mention})', inline=True)
+        if author_avatar:
+            embed.set_thumbnail(url=author_avatar)
+        if author_name is not None:
+            embed.add_field(name="User", value=f"{author_name} ({author_mention})", inline=True)
+        embed.add_field(name="Channel", value=channel_value, inline=True)
+        if audit_entry is not None and audit_entry.user is not None:
+            embed.add_field(
+                name="Deleted by",
+                value=f"{audit_entry.user} ({audit_entry.user.mention})",
+                inline=True,
+            )
 
-        if len(message.content) > 400:
-            content = content[0:400] + "..."
-        embed.add_field(name="Message", value=content +
-                        f"\n\n[Link to message]({message.jump_url})", inline=False)
-
-        embed.set_footer(text=message.author.id)
+        if message is None and snapshot is None:
+            message_value = f"Content was not available (message ID `{payload.message_id}`)."
+        else:
+            message_value = self._deleted_message_text(content, attachments, stickers, jump_url)
+        embed.add_field(name="Message", value=message_value, inline=False)
+        embed.set_footer(text=str(author_id or payload.message_id))
         embed.timestamp = datetime.now()
-        await channel.send(embed=embed)
+
+        files = []
+        try:
+            if message is not None:
+                files = await self._files_from_message(message)
+            elif snapshot is not None:
+                files = await self._files_from_snapshots(snapshot["attachments"])
+        except (discord.HTTPException, aiohttp.ClientError, TimeoutError):
+            files = []
+
+        await self._send_delete_embed(log_channel, embed, files)
 
     # @commands.Cog.listener()
     # async def on_command_error(self, ctx: GIRContext, error):
@@ -216,34 +427,74 @@ class Logging(commands.Cog):
     #         return
 
     @commands.Cog.listener()
-    async def on_bulk_message_delete(self, messages: List[discord.Message]):
-        """Log bulk message deletes. Messages are outputted to file and sent to #server-logs
-        Parameters
-        ----------
-        messages : [discord.Message]
-            List of messages that were deleted
+    async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent):
+        """Log bulk message deletes. Messages are outputted to file and sent to #server-logs.
+
+        Uses the raw event so messages that have fallen out of Discord's cache are still included
+        when this cog has seen them, including ones that were only attachments.
         """
 
-        if not messages[0].guild:
-            return
-        if messages[0].guild.id != cfg.guild_id:
+        if payload.guild_id != cfg.guild_id:
             return
 
-        members = set()
+        guild = self.bot.get_guild(payload.guild_id)
+        if guild is None:
+            return
+
         db_guild = guild_service.get_guild()
-        if messages[0].channel.id in db_guild.logging_excluded_channels:
+        if payload.channel_id in db_guild.logging_excluded_channels:
             return
 
-        channel = messages[0].guild.get_channel(cfg.channels.private_logs)
+        channel = guild.get_channel(cfg.channels.private_logs)
+        if channel is None:
+            return
+
+        source = guild.get_channel(payload.channel_id)
+        channel_value = source.mention if source is not None else f"<#{payload.channel_id}>"
+        cached_by_id = {message.id: message for message in payload.cached_messages}
+
+        members = []
+        seen_members = set()
         output = BytesIO()
-        for message in messages:
-            members.add(message.author)
+        for message_id in sorted(payload.message_ids):
+            message = cached_by_id.get(message_id)
+            snapshot = self._message_cache.pop(message_id, None)
 
-            string = f'{message.author} ({message.author.id}) [{message.created_at.strftime("%B %d, %Y, %I:%M %p")}]) UTC\n'
-            string += message.content
-            for attachment in message.attachments:
-                string += f'\n{attachment.url}'
+            if message is not None:
+                author_name = str(message.author)
+                author_id = message.author.id
+                author_mention = message.author.mention
+                created = message.created_at.strftime("%B %d, %Y, %I:%M %p")
+                content = message.content or ""
+                attachment_urls = [attachment.url for attachment in message.attachments]
+                stickers = [sticker.name for sticker in message.stickers]
+            elif snapshot is not None:
+                author_name = snapshot["author_name"]
+                author_id = snapshot["author_id"]
+                author_mention = snapshot["author_mention"]
+                created = snapshot["created_at"].strftime("%B %d, %Y, %I:%M %p")
+                content = snapshot["content"] or ""
+                attachment_urls = [attachment["url"] for attachment in snapshot["attachments"] if attachment.get("url")]
+                stickers = snapshot["stickers"]
+            else:
+                author_name = "Unknown"
+                author_id = message_id
+                author_mention = None
+                created = "unknown time"
+                content = "(content was not cached)"
+                attachment_urls = []
+                stickers = []
 
+            if author_mention is not None and author_id not in seen_members:
+                seen_members.add(author_id)
+                members.append(author_mention)
+
+            string = f'{author_name} ({author_id}) [{created}] UTC\n'
+            string += content
+            for url in attachment_urls:
+                string += f'\n{url}'
+            if stickers:
+                string += "\nStickers: " + ", ".join(stickers)
             string += "\n\n"
             output.write(string.encode('UTF-8'))
         output.seek(0)
@@ -251,18 +502,21 @@ class Logging(commands.Cog):
         member_string = ""
         for i, member in enumerate(members):
             if i == len(members) - 1 and i == 0:
-                member_string += f"{member.mention}"
+                member_string += f"{member}"
             elif i == len(members) - 1 and i != 0:
-                member_string += f"and {member.mention}"
+                member_string += f"and {member}"
             else:
-                member_string += f"{member.mention}, "
+                member_string += f"{member}, "
 
         embed = discord.Embed(title="Bulk Message Deleted")
         embed.color = discord.Color.red()
-        embed.add_field(
-            name="Users", value=f'This batch included {len(messages)} messages from {member_string}', inline=True)
-        embed.add_field(
-            name="Channel", value=message.channel.mention, inline=True)
+        users_value = f"This batch included {len(payload.message_ids)} messages"
+        if member_string:
+            users_value += f" from {member_string}"
+        if len(users_value) > 1024:
+            users_value = users_value[:1021] + "..."
+        embed.add_field(name="Users", value=users_value, inline=True)
+        embed.add_field(name="Channel", value=channel_value, inline=True)
         embed.timestamp = datetime.now()
         await channel.send(embed=embed)
         await channel.send(file=discord.File(output, 'message.txt'))
