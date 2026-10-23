@@ -1,4 +1,21 @@
 #!/usr/bin/env python3
+"""
+Pull fully-qualified emoji list from official Unicode data
+and store the corresponding iOS / Apple emoji images as base64 in emojis.json.
+
+Unicode note (from their charts):
+  "While these charts use a particular version of the Unicode Emoji data files,
+   the images and format may be updated at any time.
+   For any production usage, consult those data files."
+
+This script therefore uses the official data file:
+  https://unicode.org/Public/emoji/latest/emoji-test.txt
+
+Apple/iOS images are not hosted by Unicode. They are pulled from a maintained
+public mirror of the Apple Color Emoji set (RealityRipple/emoji on jsDelivr).
+On macOS you can alternatively extract directly from:
+  /System/Library/Fonts/Apple Color Emoji.ttc
+"""
 
 import asyncio
 import base64
@@ -16,6 +33,7 @@ JSON_PATH = Path("emojis.json")
 
 
 def codepoints_to_filename(codepoints: list[str]) -> str:
+    """Turn ['1F600'] or ['1F1E6', '1F1E8'] into '1f600' / '1f1e6-1f1e8'."""
     return "-".join(cp.lower() for cp in codepoints)
 
 
@@ -26,6 +44,7 @@ async def fetch_text(session: aiohttp.ClientSession, url: str) -> str:
 
 
 def parse_emoji_test(text: str) -> list[dict]:
+    """Parse official emoji-test.txt → list of fully-qualified emoji."""
     emoji_list = []
     current_group = None
     current_subgroup = None
@@ -68,6 +87,7 @@ def parse_emoji_test(text: str) -> list[dict]:
 
 
 async def download_apple_b64(session: aiohttp.ClientSession, emoji: dict) -> tuple[str | None, str]:
+    """Returns (base64_or_None, source_or_error). Tries primary CDN then fallback."""
     code = emoji["filename"]
     sources = [
         (APPLE_CDN.format(code=code), "primary"),
@@ -109,26 +129,18 @@ async def main():
         failures = []
         output = {}
         for e, b64, source in results:
-            entry = {
-                "name": e["name"],
-                "codepoints": e["codepoints"],
-                "group": e["group"],
-                "subgroup": e["subgroup"],
-            }
             if b64:
                 success += 1
-                entry["image"] = b64
+                output[e["emoji"]] = b64
                 if source == "fallback":
                     fallback_used += 1
             else:
-                entry["image"] = None
                 failures.append({
                     "emoji": e["emoji"],
                     "name": e["name"],
                     "filename": e["filename"],
                     "reason": source,
                 })
-            output[e["emoji"]] = entry
 
         print(f"Downloaded {success}/{len(emojis)} Apple PNGs ({fallback_used} via fallback)")
 
